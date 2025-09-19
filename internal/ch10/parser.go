@@ -62,6 +62,13 @@ func parseSecHdrFlags(hdr *PacketHeader) (bool, uint8) {
 	return has, tf
 }
 
+func isTimePacket(hdr *PacketHeader) bool {
+	if hdr == nil {
+		return false
+	}
+	return hdr.DataType == 0x0000
+}
+
 func decodeIPTSToMicros(tf uint8, raw []byte) (int64, SecondaryHeader, error) {
 	secondary := SecondaryHeader{HasSecHdr: true, TimeFormat: tf, TimeStampUs: -1}
 	if len(raw) < secondaryTimeFieldLen {
@@ -108,6 +115,11 @@ type Reader struct {
 	primary    PacketHeader
 	primarySet bool
 	index      FileIndex
+
+	lastTimeRefUs         int64
+	timeSeen              bool
+	timeSeenBeforeDynamic bool
+	dynamicSeen           bool
 }
 
 // NewReader opens the file at path and prepares an iterator.
@@ -122,10 +134,15 @@ func NewReader(path string) (*Reader, error) {
 		return nil, err
 	}
 	return &Reader{
-		file:         f,
-		size:         info.Size(),
-		resyncWindow: defaultResyncWindow,
-		resyncBuf:    make([]byte, defaultResyncWindow),
+		file:                  f,
+		size:                  info.Size(),
+		resyncWindow:          defaultResyncWindow,
+		resyncBuf:             make([]byte, defaultResyncWindow),
+		lastTimeRefUs:         -1,
+		timeSeenBeforeDynamic: true,
+		index: FileIndex{
+			TimeSeenBeforeDynamic: true,
+		},
 	}, nil
 }
 
@@ -150,7 +167,9 @@ func (r *Reader) PrimaryHeader() (PacketHeader, bool) {
 // Index returns a copy of the accumulated file index.
 func (r *Reader) Index() FileIndex {
 	out := FileIndex{
-		Packets: make([]PacketIndex, len(r.index.Packets)),
+		Packets:               make([]PacketIndex, len(r.index.Packets)),
+		HasTimePacket:         r.index.HasTimePacket,
+		TimeSeenBeforeDynamic: r.index.TimeSeenBeforeDynamic,
 	}
 	copy(out.Packets, r.index.Packets)
 	return out
@@ -204,6 +223,7 @@ func (r *Reader) Next() (PacketHeader, PacketIndex, error) {
 		}
 
 		hasSecHdr, timeFmt := parseSecHdrFlags(&hdr)
+		isTime := isTimePacket(&hdr)
 		idx := PacketIndex{
 			Offset:       r.offset,
 			ChannelID:    hdr.ChannelID,
@@ -214,11 +234,15 @@ func (r *Reader) Next() (PacketHeader, PacketIndex, error) {
 			DataLength:   hdr.DataLength,
 			HasSecHdr:    hasSecHdr,
 			TimeStampUs:  -1,
+			TimeFormat:   timeFmt,
+			Source:       TimestampSourceUnknown,
+			IsTimePacket: isTime,
 		}
 
+		secOffset := r.offset + primaryHeaderSize
 		if hasSecHdr {
-			secOffset := r.offset + primaryHeaderSize
 			if secOffset+secondaryHeaderSize <= nextOffset && secOffset+secondaryHeaderSize <= r.size {
+				idx.SecHdrBytes = true
 				buf := make([]byte, secondaryTimeFieldLen)
 				if _, err := r.file.ReadAt(buf, secOffset); err == nil {
 					ts, secondary, err := decodeIPTSToMicros(timeFmt, buf)
@@ -230,7 +254,9 @@ func (r *Reader) Next() (PacketHeader, PacketIndex, error) {
 						}
 					} else {
 						idx.TimeStampUs = ts
-						idx.HasSecHdr = secondary.HasSecHdr
+						idx.SecHdrValid = true
+						idx.TimeFormat = secondary.TimeFormat
+						idx.Source = TimestampSourceSecondaryHeader
 					}
 				} else {
 					common.Logf("packet at offset %d timestamp read failed: %v", r.offset, err)
@@ -239,6 +265,71 @@ func (r *Reader) Next() (PacketHeader, PacketIndex, error) {
 				common.Logf("packet at offset %d missing secondary header bytes", r.offset)
 			}
 		}
+
+		payloadOffset := secOffset
+		payloadLen := int64(hdr.DataLength)
+		if hasSecHdr {
+			payloadOffset += int64(secondaryHeaderSize)
+			if payloadLen >= int64(secondaryHeaderSize) {
+				payloadLen -= int64(secondaryHeaderSize)
+			} else {
+				payloadLen = 0
+			}
+		}
+		if payloadOffset > nextOffset {
+			payloadLen = 0
+		}
+		maxPayload := nextOffset - payloadOffset
+		if payloadLen > maxPayload {
+			payloadLen = maxPayload
+		}
+		if payloadLen < 0 {
+			payloadLen = 0
+		}
+
+		if isTime {
+			r.index.HasTimePacket = true
+			if idx.TimeStampUs < 0 && payloadLen >= int64(secondaryTimeFieldLen) {
+				buf := make([]byte, secondaryTimeFieldLen)
+				if _, err := r.file.ReadAt(buf, payloadOffset); err == nil {
+					ts, _, err := decodeIPTSToMicros(timeFmt, buf)
+					if err == nil {
+						idx.TimeStampUs = ts
+					}
+				}
+			}
+			if idx.TimeStampUs >= 0 {
+				r.lastTimeRefUs = idx.TimeStampUs
+				r.timeSeen = true
+				idx.Source = TimestampSourceTimePacket
+			}
+		} else {
+			if !r.dynamicSeen {
+				r.dynamicSeen = true
+				if !r.timeSeen {
+					r.timeSeenBeforeDynamic = false
+				}
+			}
+			if idx.TimeStampUs < 0 && payloadLen >= int64(secondaryTimeFieldLen) {
+				buf := make([]byte, secondaryTimeFieldLen)
+				if _, err := r.file.ReadAt(buf, payloadOffset); err == nil {
+					ipts := int64(binary.BigEndian.Uint64(buf))
+					if r.lastTimeRefUs >= 0 {
+						idx.TimeStampUs = r.lastTimeRefUs + ipts
+						idx.Source = TimestampSourceIPTS
+					}
+				}
+			}
+		}
+
+		if idx.Source == TimestampSourceUnknown && idx.SecHdrValid && !isTime {
+			idx.Source = TimestampSourceSecondaryHeader
+		}
+		if isTime && idx.Source == TimestampSourceSecondaryHeader {
+			idx.Source = TimestampSourceTimePacket
+		}
+
+		r.index.TimeSeenBeforeDynamic = r.timeSeenBeforeDynamic
 
 		r.index.Packets = append(r.index.Packets, idx)
 
