@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -62,17 +61,29 @@ func validateCmd(args []string) {
 	}
 
 	rp, err := rules.LoadRulePack(*rulesPath)
-	if err != nil { fmt.Println("load rulepack:", err); os.Exit(1) }
+	if err != nil {
+		fmt.Println("load rulepack:", err)
+		os.Exit(1)
+	}
 	engine := rules.NewEngine(rp)
 	engine.RegisterBuiltins()
 
 	ctx := &rules.Context{InputFile: *in, TMATSFile: *tmats, Profile: *profile}
 	diags, err := engine.Eval(ctx)
-	if err != nil { fmt.Println("eval:", err); os.Exit(1) }
+	if err != nil {
+		fmt.Println("eval:", err)
+		os.Exit(1)
+	}
 
-	if err := engine.WriteDiagnosticsNDJSON(*outDiag); err != nil { fmt.Println("write diags:", err); os.Exit(1) }
+	if err := engine.WriteDiagnosticsNDJSON(*outDiag); err != nil {
+		fmt.Println("write diags:", err)
+		os.Exit(1)
+	}
 	rep := engine.MakeAcceptance()
-	if err := report.SaveAcceptanceJSON(rep, *outAcc); err != nil { fmt.Println("write report:", err); os.Exit(1) }
+	if err := report.SaveAcceptanceJSON(rep, *outAcc); err != nil {
+		fmt.Println("write report:", err)
+		os.Exit(1)
+	}
 	fmt.Printf("PASS=%v, errors=%d, warnings=%d, diagnostics=%d\n", rep.Summary.Pass, rep.Summary.Errors, rep.Summary.Warnings, len(diags))
 }
 
@@ -98,12 +109,18 @@ func manifestCmd(args []string) {
 
 	paths := strings.Split(*inputs, ",")
 	m, err := manifest.Build(paths)
-	if err != nil { fmt.Println("manifest build:", err); os.Exit(1) }
+	if err != nil {
+		fmt.Println("manifest build:", err)
+		os.Exit(1)
+	}
 
 	// Signing placeholder: left as future step using internal/crypto
 	_ = sign
 
-	if err := manifest.Save(m, *out); err != nil { fmt.Println("manifest save:", err); os.Exit(1) }
+	if err := manifest.Save(m, *out); err != nil {
+		fmt.Println("manifest save:", err)
+		os.Exit(1)
+	}
 	fmt.Println("Wrote", *out)
 }
 
@@ -114,6 +131,9 @@ func batchCmd(args []string) {
 	rulesPath := fs.String("rules", "", "rulepack.json")
 	outDir := fs.String("out-dir", "out", "results directory")
 	fs.Parse(args)
-	_ = inDir; _ = profile; _ = rulesPath; _ = outDir
+	_ = inDir
+	_ = profile
+	_ = rulesPath
+	_ = outDir
 	fmt.Println("Batch mode placeholder: iterate files and call validate")
 }

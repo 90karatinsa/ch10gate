@@ -1,15 +1,13 @@
 package rules
 
 import (
-	"io"
-	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
 
 	"example.com/ch10gate/internal/ch10"
-	"example.com/ch10gate/internal/common"
 	"example.com/ch10gate/internal/tmats"
 )
 
