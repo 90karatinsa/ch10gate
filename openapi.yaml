@@ -1,0 +1,139 @@
+openapi: 3.1.0
+info:
+  title: CH10 Gate Validator API
+  version: "1.0"
+paths:
+  /validate:
+    post:
+      summary: Validate inputs and produce diagnostics + acceptance
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [inputs, profile]
+              properties:
+                inputs: {type: array, items: {type: string, description: "paths"}}
+                tmats: {type: string}
+                profile: {enum: ["106-09","106-11","106-13","106-15","106-20"]}
+                rulePack: {type: object}
+      responses:
+        "200":
+          description: acceptance JSON
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AcceptanceReport"
+  /auto-fix:
+    post:
+      summary: Apply auto-fixes where possible
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [input, profile, rulePack]
+              properties:
+                input: {type: string}
+                tmats: {type: string}
+                output: {type: string}
+                profile: {type: string}
+                rulePack: {type: object}
+                dryRun: {type: boolean}
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FixResult"
+  /manifest:
+    post:
+      summary: Build a manifest with hashes
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [inputs, shaAlgo]
+              properties:
+                inputs: {type: array, items: {type: string}}
+                shaAlgo: {enum: ["sha256","sha512"]}
+                sign: {type: boolean}
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Manifest"
+  /profiles:
+    get:
+      summary: List supported profiles
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {type: string}
+components:
+  schemas:
+    Diagnostic:
+      type: object
+      properties:
+        ts: {type: string, format: date-time}
+        file: {type: string}
+        channelId: {type: integer}
+        packetIndex: {type: integer}
+        offset: {type: string}
+        ruleId: {type: string}
+        severity: {enum: ["ERROR","WARN","INFO"]}
+        message: {type: string}
+        refs: {type: array, items: {type: string}}
+        fixSuggested: {type: boolean}
+        fixApplied: {type: boolean}
+        fixPatchId: {type: string}
+    AcceptanceReport:
+      type: object
+      properties:
+        summary:
+          type: object
+          properties:
+            total: {type: integer}
+            errors: {type: integer}
+            warnings: {type: integer}
+            pass: {type: boolean}
+        findings:
+          type: array
+          items:
+            $ref: "#/components/schemas/Diagnostic"
+    FixResult:
+      type: object
+      properties:
+        outputFile: {type: string}
+        auditTrail:
+          type: array
+          items: {type: object}
+    Manifest:
+      type: object
+      properties:
+        createdAt: {type: string, format: date-time}
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              path: {type: string}
+              size: {type: integer}
+              sha256: {type: string}
+              type: {type: string}
+        shaAlgo: {type: string}
+        signature:
+          type: object
+          properties:
+            type: {type: string}
+            certSubject: {type: string}
+            issuer: {type: string}
+            signatureFile: {type: string}

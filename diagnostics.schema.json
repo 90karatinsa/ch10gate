@@ -1,0 +1,20 @@
+{
+  "$schema":"https://json-schema.org/draft/2020-12/schema",
+  "title":"DiagnosticEntry",
+  "type":"object",
+  "properties":{
+    "ts":{"type":"string","format":"date-time"},
+    "file":{"type":"string"},
+    "channelId":{"type":"integer"},
+    "packetIndex":{"type":"integer"},
+    "offset":{"type":"string"},
+    "ruleId":{"type":"string"},
+    "severity":{"enum":["ERROR","WARN","INFO"]},
+    "message":{"type":"string"},
+    "refs":{"type":"array","items":{"type":"string"}},
+    "fixSuggested":{"type":"boolean"},
+    "fixApplied":{"type":"boolean"},
+    "fixPatchId":{"type":"string"}
+  },
+  "required":["ts","file","ruleId","severity","message"]
+}

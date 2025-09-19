@@ -1,0 +1,16 @@
+{
+  "$schema":"https://json-schema.org/draft/2020-12/schema",
+  "title":"GateManifest",
+  "type":"object",
+  "properties":{
+    "createdAt":{"type":"string","format":"date-time"},
+    "shaAlgo":{"enum":["sha256","sha512"]},
+    "items":{"type":"array","items":{
+      "type":"object",
+      "properties":{"path":{"type":"string"},"size":{"type":"integer"},"sha256":{"type":"string","pattern":"^[a-f0-9]{64}$"},"type":{"enum":["ch10","tmats","pdf","json","other"]}},
+      "required":["path","sha256","type"]
+    }},
+    "signature":{"type":"object","properties":{"type":{"enum":["PKCS7","JWS"]},"certSubject":{"type":"string"},"issuer":{"type":"string"},"signatureFile":{"type":"string"}}}
+  },
+  "required":["createdAt","items","shaAlgo"]
+}

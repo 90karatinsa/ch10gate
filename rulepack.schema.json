@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/ch10/rulepack.schema.json",
+  "title": "IRIG-106 Rule Pack",
+  "type": "object",
+  "properties": {
+    "rulePackId": {"type": "string"},
+    "version": {"type": "string"},
+    "profile": {"enum": ["106-09","106-11","106-13","106-15","106-20"]},
+    "rules": {"type": "array", "items": {"$ref": "#/$defs/rule"}}
+  },
+  "required": ["rulePackId","version","profile","rules"],
+  "$defs": {
+    "rule": {
+      "type": "object",
+      "properties": {
+        "ruleId": {"type": "string"},
+        "name": {"type": "string"},
+        "scope": {"enum": ["packet","channel","file","tmats"]},
+        "appliesTo": {"type": "object"},
+        "severity": {"enum": ["ERROR","WARN","INFO"]},
+        "fixable": {"type": "boolean"},
+        "fixFunction": {"type": "string"},
+        "refs": {"type": "array", "items": {"type": "string"}},
+        "params": {"type": "object"},
+        "message": {"type": "string"}
+      },
+      "required": ["ruleId","severity","fixable","refs","message"]
+    }
+  }
+}
