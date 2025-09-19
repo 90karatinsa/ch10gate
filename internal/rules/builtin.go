@@ -15,6 +15,10 @@ import (
 
 const ch10PrimaryHeaderSize = 20
 
+func int64Ptr(v int64) *int64 { return &v }
+
+func stringPtr(s string) *string { return &s }
+
 func (e *Engine) RegisterBuiltins() {
 	e.Register("CheckSyncPattern", CheckSyncPattern)
 	e.Register("FixHeaderChecksum", FixHeaderChecksum)
@@ -488,7 +492,120 @@ func BlockUnknownDataType(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 }
 
 func EnsureTimePacket(ctx *Context, rule Rule) (Diagnostic, bool, error) {
-	return Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: INFO, Message: "skipped (implemented in Part 2)", Refs: rule.Refs}, false, nil
+	diag := Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: INFO, Message: "time packet inspection", Refs: rule.Refs}
+	if ctx == nil {
+		diag.Severity = ERROR
+		diag.Message = "no context provided"
+		return diag, false, errors.New("nil context")
+	}
+	if err := ctx.EnsureFileIndex(); err != nil {
+		diag.Severity = ERROR
+		diag.Message = "cannot index file"
+		return diag, false, err
+	}
+	if ctx.Index == nil || len(ctx.Index.Packets) == 0 {
+		diag.Message = "no packets to inspect"
+		return diag, false, nil
+	}
+
+	idx := ctx.Index
+	if !idx.HasTimePacket {
+		diag.Severity = ERROR
+		diag.Message = "no time packets detected"
+		return diag, false, nil
+	}
+
+	var (
+		firstTimeIdx       = -1
+		firstDynamicIdx    = -1
+		firstTimePacket    *ch10.PacketIndex
+		firstDynamicPacket *ch10.PacketIndex
+		missingSecHdrIdx   = -1
+		unsupportedIdx     = -1
+	)
+
+	for i := range idx.Packets {
+		pkt := &idx.Packets[i]
+		if pkt.IsTimePacket {
+			if firstTimeIdx == -1 {
+				firstTimeIdx = i
+				firstTimePacket = pkt
+			}
+			continue
+		}
+		if firstDynamicIdx == -1 {
+			firstDynamicIdx = i
+			firstDynamicPacket = pkt
+		}
+		if pkt.HasSecHdr && !pkt.SecHdrBytes {
+			missingSecHdrIdx = i
+			break
+		}
+		if pkt.HasSecHdr && pkt.SecHdrBytes && !pkt.SecHdrValid && unsupportedIdx == -1 {
+			unsupportedIdx = i
+		}
+	}
+
+	if firstTimePacket != nil && firstTimePacket.TimeStampUs >= 0 {
+		diag.TimestampUs = int64Ptr(firstTimePacket.TimeStampUs)
+		src := string(firstTimePacket.Source)
+		diag.TimestampSource = stringPtr(src)
+	} else if firstDynamicPacket != nil && firstDynamicPacket.TimeStampUs >= 0 {
+		diag.TimestampUs = int64Ptr(firstDynamicPacket.TimeStampUs)
+		src := string(firstDynamicPacket.Source)
+		diag.TimestampSource = stringPtr(src)
+	}
+
+	if missingSecHdrIdx >= 0 {
+		pkt := idx.Packets[missingSecHdrIdx]
+		diag.Severity = ERROR
+		diag.PacketIndex = missingSecHdrIdx
+		diag.ChannelId = int(pkt.ChannelID)
+		diag.Offset = fmt.Sprintf("0x%X", pkt.Offset)
+		diag.Message = "secondary header flag set but bytes missing"
+		return diag, false, nil
+	}
+
+	if !idx.TimeSeenBeforeDynamic {
+		diag.Severity = WARN
+		diag.Message = "first dynamic packet observed before time reference"
+		if firstDynamicIdx >= 0 {
+			pkt := idx.Packets[firstDynamicIdx]
+			diag.PacketIndex = firstDynamicIdx
+			diag.ChannelId = int(pkt.ChannelID)
+			diag.Offset = fmt.Sprintf("0x%X", pkt.Offset)
+			if diag.TimestampUs == nil && pkt.TimeStampUs >= 0 {
+				diag.TimestampUs = int64Ptr(pkt.TimeStampUs)
+				src := string(pkt.Source)
+				diag.TimestampSource = stringPtr(src)
+			}
+		}
+		return diag, false, nil
+	}
+
+	if unsupportedIdx >= 0 {
+		pkt := idx.Packets[unsupportedIdx]
+		diag.Severity = WARN
+		diag.PacketIndex = unsupportedIdx
+		diag.ChannelId = int(pkt.ChannelID)
+		diag.Offset = fmt.Sprintf("0x%X", pkt.Offset)
+		diag.Message = "secondary header time format unsupported"
+		if diag.TimestampUs == nil && pkt.TimeStampUs >= 0 {
+			diag.TimestampUs = int64Ptr(pkt.TimeStampUs)
+			src := string(pkt.Source)
+			diag.TimestampSource = stringPtr(src)
+		}
+		return diag, false, nil
+	}
+
+	diag.Message = "time packet present before first dynamic packet"
+	if firstTimeIdx >= 0 {
+		pkt := idx.Packets[firstTimeIdx]
+		diag.PacketIndex = firstTimeIdx
+		diag.ChannelId = int(pkt.ChannelID)
+		diag.Offset = fmt.Sprintf("0x%X", pkt.Offset)
+	}
+	return diag, false, nil
 }
 
 func FixPCMAlign(ctx *Context, rule Rule) (Diagnostic, bool, error) {
@@ -544,7 +661,74 @@ func NormalizeTMATSChannelMap(ctx *Context, rule Rule) (Diagnostic, bool, error)
 }
 
 func SyncSecondaryTimeFmt(ctx *Context, rule Rule) (Diagnostic, bool, error) {
-	return Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: INFO, Message: "secondary time format sync deferred", Refs: rule.Refs}, false, nil
+	diag := Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: INFO, Message: "secondary time format inspection", Refs: rule.Refs}
+	if ctx == nil {
+		diag.Severity = ERROR
+		diag.Message = "no context provided"
+		return diag, false, errors.New("nil context")
+	}
+	if err := ctx.EnsureFileIndex(); err != nil {
+		diag.Severity = ERROR
+		diag.Message = "cannot index file"
+		return diag, false, err
+	}
+	if ctx.Index == nil || len(ctx.Index.Packets) == 0 {
+		diag.Message = "no packets to inspect"
+		return diag, false, nil
+	}
+
+	var (
+		expected uint8
+		have     bool
+		mismatch = -1
+	)
+
+	for i := range ctx.Index.Packets {
+		pkt := &ctx.Index.Packets[i]
+		if !pkt.HasSecHdr || !pkt.SecHdrBytes || !pkt.SecHdrValid {
+			continue
+		}
+		if !have {
+			expected = pkt.TimeFormat
+			have = true
+			diag.PacketIndex = i
+			diag.ChannelId = int(pkt.ChannelID)
+			diag.Offset = fmt.Sprintf("0x%X", pkt.Offset)
+			if pkt.TimeStampUs >= 0 {
+				diag.TimestampUs = int64Ptr(pkt.TimeStampUs)
+				src := string(pkt.Source)
+				diag.TimestampSource = stringPtr(src)
+			}
+			continue
+		}
+		if pkt.TimeFormat != expected {
+			mismatch = i
+			break
+		}
+	}
+
+	if !have {
+		diag.Message = "no packets with secondary header timestamps"
+		return diag, false, nil
+	}
+
+	if mismatch >= 0 {
+		pkt := ctx.Index.Packets[mismatch]
+		diag.Severity = WARN
+		diag.PacketIndex = mismatch
+		diag.ChannelId = int(pkt.ChannelID)
+		diag.Offset = fmt.Sprintf("0x%X", pkt.Offset)
+		diag.Message = fmt.Sprintf("secondary header time formats inconsistent: 0x%X vs 0x%X", pkt.TimeFormat, expected)
+		if pkt.TimeStampUs >= 0 {
+			diag.TimestampUs = int64Ptr(pkt.TimeStampUs)
+			src := string(pkt.Source)
+			diag.TimestampSource = stringPtr(src)
+		}
+		return diag, false, nil
+	}
+
+	diag.Message = fmt.Sprintf("secondary header time format consistent (0x%X)", expected)
+	return diag, false, nil
 }
 
 func FixFileExtension(ctx *Context, rule Rule) (Diagnostic, bool, error) {

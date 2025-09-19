@@ -18,6 +18,15 @@ type SecondaryHeader struct {
 	TimeStampUs int64
 }
 
+type TimestampSource string
+
+const (
+	TimestampSourceUnknown         TimestampSource = ""
+	TimestampSourceSecondaryHeader TimestampSource = "secondary_header"
+	TimestampSourceTimePacket      TimestampSource = "time_packet"
+	TimestampSourceIPTS            TimestampSource = "ipts"
+)
+
 type PacketIndex struct {
 	Offset       int64
 	ChannelID    uint16
@@ -27,10 +36,17 @@ type PacketIndex struct {
 	PacketLength uint32
 	DataLength   uint32
 	HasSecHdr    bool
+	SecHdrValid  bool
+	SecHdrBytes  bool
+	TimeFormat   uint8
 	HasTrailer   bool
 	TimeStampUs  int64
+	Source       TimestampSource
+	IsTimePacket bool
 }
 
 type FileIndex struct {
-	Packets []PacketIndex
+	Packets               []PacketIndex
+	HasTimePacket         bool
+	TimeSeenBeforeDynamic bool
 }

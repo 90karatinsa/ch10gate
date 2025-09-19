@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"time"
 
 	"example.com/ch10gate/internal/ch10"
@@ -40,19 +42,20 @@ type RulePack struct {
 }
 
 type Diagnostic struct {
-	Ts           time.Time `json:"ts"`
-	File         string    `json:"file"`
-	ChannelId    int       `json:"channelId,omitempty"`
-	PacketIndex  int       `json:"packetIndex,omitempty"`
-	Offset       string    `json:"offset,omitempty"`
-	RuleId       string    `json:"ruleId"`
-	Severity     Severity  `json:"severity"`
-	Message      string    `json:"message"`
-	Refs         []string  `json:"refs"`
-	FixSuggested bool      `json:"fixSuggested"`
-	FixApplied   bool      `json:"fixApplied"`
-	FixPatchId   string    `json:"fixPatchId,omitempty"`
-	TimestampUs  *int64    `json:"timestamp_us"`
+	Ts              time.Time `json:"ts"`
+	File            string    `json:"file"`
+	ChannelId       int       `json:"channelId,omitempty"`
+	PacketIndex     int       `json:"packetIndex,omitempty"`
+	Offset          string    `json:"offset,omitempty"`
+	RuleId          string    `json:"ruleId"`
+	Severity        Severity  `json:"severity"`
+	Message         string    `json:"message"`
+	Refs            []string  `json:"refs"`
+	FixSuggested    bool      `json:"fixSuggested"`
+	FixApplied      bool      `json:"fixApplied"`
+	FixPatchId      string    `json:"fixPatchId,omitempty"`
+	TimestampUs     *int64    `json:"timestamp_us"`
+	TimestampSource *string   `json:"timestamp_source"`
 }
 
 type AcceptanceReport struct {
@@ -111,15 +114,17 @@ func (ctx *Context) EnsureFileIndex() error {
 }
 
 type Engine struct {
-	rulePack    RulePack
-	registry    map[string]FixFunc
-	diagnostics []Diagnostic
+	rulePack               RulePack
+	registry               map[string]FixFunc
+	diagnostics            []Diagnostic
+	includeTimestampFields bool
 }
 
 func NewEngine(rp RulePack) *Engine {
 	return &Engine{
-		rulePack: rp,
-		registry: make(map[string]FixFunc),
+		rulePack:               rp,
+		registry:               make(map[string]FixFunc),
+		includeTimestampFields: true,
 	}
 }
 
@@ -170,11 +175,71 @@ func (e *Engine) WriteDiagnosticsNDJSON(path string) error {
 	w := bufio.NewWriter(f)
 	defer w.Flush()
 	for _, d := range e.diagnostics {
-		b, _ := json.Marshal(d)
+		var b []byte
+		if e.includeTimestampFields {
+			b, _ = json.Marshal(d)
+		} else {
+			b, _ = json.Marshal(d.toNoTimestamp())
+		}
 		w.Write(b)
 		w.WriteString("\n")
 	}
 	return nil
+}
+
+type diagnosticNoTimestamp struct {
+	Ts           time.Time `json:"ts"`
+	File         string    `json:"file"`
+	ChannelId    int       `json:"channelId,omitempty"`
+	PacketIndex  int       `json:"packetIndex,omitempty"`
+	Offset       string    `json:"offset,omitempty"`
+	RuleId       string    `json:"ruleId"`
+	Severity     Severity  `json:"severity"`
+	Message      string    `json:"message"`
+	Refs         []string  `json:"refs"`
+	FixSuggested bool      `json:"fixSuggested"`
+	FixApplied   bool      `json:"fixApplied"`
+	FixPatchId   string    `json:"fixPatchId,omitempty"`
+}
+
+func (d Diagnostic) toNoTimestamp() diagnosticNoTimestamp {
+	return diagnosticNoTimestamp{
+		Ts:           d.Ts,
+		File:         d.File,
+		ChannelId:    d.ChannelId,
+		PacketIndex:  d.PacketIndex,
+		Offset:       d.Offset,
+		RuleId:       d.RuleId,
+		Severity:     d.Severity,
+		Message:      d.Message,
+		Refs:         d.Refs,
+		FixSuggested: d.FixSuggested,
+		FixApplied:   d.FixApplied,
+		FixPatchId:   d.FixPatchId,
+	}
+}
+
+func (e *Engine) SetConfigValue(key string, value any) {
+	if e == nil {
+		return
+	}
+	switch key {
+	case "diag.include_timestamps":
+		switch v := value.(type) {
+		case bool:
+			e.includeTimestampFields = v
+		case string:
+			if b, err := strconv.ParseBool(v); err == nil {
+				e.includeTimestampFields = b
+			}
+		default:
+			if s, ok := value.(fmt.Stringer); ok {
+				if b, err := strconv.ParseBool(s.String()); err == nil {
+					e.includeTimestampFields = b
+				}
+			}
+		}
+	}
 }
 
 func (e *Engine) MakeAcceptance() AcceptanceReport {

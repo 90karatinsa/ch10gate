@@ -53,6 +53,7 @@ func validateCmd(args []string) {
 	rulesPath := fs.String("rules", "", "rulepack.json")
 	outDiag := fs.String("out", "diagnostics.jsonl", "diagnostics output")
 	outAcc := fs.String("acceptance", "acceptance_report.json", "acceptance json")
+	includeTimestamps := fs.Bool("diag-include-timestamps", true, "include timestamp metadata in diagnostics output")
 	fs.Parse(args)
 
 	if *in == "" || *rulesPath == "" {
@@ -67,6 +68,7 @@ func validateCmd(args []string) {
 	}
 	engine := rules.NewEngine(rp)
 	engine.RegisterBuiltins()
+	engine.SetConfigValue("diag.include_timestamps", *includeTimestamps)
 
 	ctx := &rules.Context{InputFile: *in, TMATSFile: *tmats, Profile: *profile}
 	diags, err := engine.Eval(ctx)
