@@ -3,6 +3,7 @@ package ch10
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 
@@ -16,7 +17,8 @@ const (
 )
 
 var (
-	ErrNoSync = errors.New("sync pattern 0xEB25 not found at expected position")
+	ErrNoSync             = errors.New("sync pattern 0xEB25 not found at expected position")
+	ErrUnsupportedProfile = errors.New("unsupported Chapter 10 profile")
 )
 
 func ParsePrimaryHeader(r io.ReaderAt, offset int64) (PacketHeader, error) {
@@ -234,4 +236,89 @@ func ScanFileMin(path string) (PacketHeader, FileIndex, error) {
 		return PacketHeader{}, idx, ErrNoSync
 	}
 	return hdr, idx, nil
+}
+
+// ComputeHeaderChecksum calculates the header checksum for the supplied
+// primary header bytes using the active profile rules.
+func ComputeHeaderChecksum(profile string, header []byte) (uint16, error) {
+	if len(header) < primaryHeaderSize {
+		return 0, fmt.Errorf("header too short: %d bytes", len(header))
+	}
+	switch profile {
+	case "106-15":
+		var sum uint32
+		// The checksum is computed across the first 16 bytes of the
+		// primary header (through the flags field).
+		for i := 0; i < 16; i += 2 {
+			word := binary.BigEndian.Uint16(header[i : i+2])
+			sum += uint32(word)
+			sum = (sum & 0xFFFF) + (sum >> 16)
+		}
+		return ^uint16(sum & 0xFFFF), nil
+	default:
+		return 0, fmt.Errorf("%w: %s", ErrUnsupportedProfile, profile)
+	}
+}
+
+// DataChecksum encapsulates a streaming CRC-16 calculation for payload data.
+type DataChecksum struct {
+	value  uint16
+	poly   uint16
+	xorOut uint16
+}
+
+type dataChecksumParams struct {
+	poly   uint16
+	init   uint16
+	xorOut uint16
+}
+
+var dataChecksumProfiles = map[string]dataChecksumParams{
+	"106-15": {poly: 0x1021, init: 0xFFFF, xorOut: 0x0000},
+}
+
+// NewDataChecksum returns an initialized checksum calculator for the supplied
+// profile.
+func NewDataChecksum(profile string) (*DataChecksum, error) {
+	params, ok := dataChecksumProfiles[profile]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrUnsupportedProfile, profile)
+	}
+	return &DataChecksum{value: params.init, poly: params.poly, xorOut: params.xorOut}, nil
+}
+
+// Write updates the checksum with the provided data.
+func (c *DataChecksum) Write(p []byte) {
+	if c == nil {
+		return
+	}
+	for _, b := range p {
+		c.value ^= uint16(b) << 8
+		for i := 0; i < 8; i++ {
+			if c.value&0x8000 != 0 {
+				c.value = (c.value << 1) ^ c.poly
+			} else {
+				c.value <<= 1
+			}
+			c.value &= 0xFFFF
+		}
+	}
+}
+
+// Sum16 returns the final checksum value.
+func (c *DataChecksum) Sum16() uint16 {
+	if c == nil {
+		return 0
+	}
+	return (c.value ^ c.xorOut) & 0xFFFF
+}
+
+// ComputeDataChecksum calculates the checksum for the provided payload slice.
+func ComputeDataChecksum(profile string, payload []byte) (uint16, error) {
+	calc, err := NewDataChecksum(profile)
+	if err != nil {
+		return 0, err
+	}
+	calc.Write(payload)
+	return calc.Sum16(), nil
 }
