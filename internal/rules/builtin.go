@@ -265,7 +265,7 @@ func FixDataChecksumOrTrailer(ctx *Context, rule Rule) (Diagnostic, bool, error)
 func SyncSecondaryHeaderFlag(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 	return Diagnostic{
 		Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: INFO,
-		Message: "secondary header flag sync skipped (not implemented)", Refs: rule.Refs,
+		Message: "skipped (implemented in Part 2)", Refs: rule.Refs,
 	}, false, nil
 }
 
@@ -488,7 +488,7 @@ func BlockUnknownDataType(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 }
 
 func EnsureTimePacket(ctx *Context, rule Rule) (Diagnostic, bool, error) {
-	return Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: INFO, Message: "time packet check deferred (iteration not implemented)", Refs: rule.Refs}, false, nil
+	return Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: INFO, Message: "skipped (implemented in Part 2)", Refs: rule.Refs}, false, nil
 }
 
 func FixPCMAlign(ctx *Context, rule Rule) (Diagnostic, bool, error) {

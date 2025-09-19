@@ -52,6 +52,7 @@ type Diagnostic struct {
 	FixSuggested bool      `json:"fixSuggested"`
 	FixApplied   bool      `json:"fixApplied"`
 	FixPatchId   string    `json:"fixPatchId,omitempty"`
+	TimestampUs  *int64    `json:"timestamp_us"`
 }
 
 type AcceptanceReport struct {
