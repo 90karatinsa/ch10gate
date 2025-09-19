@@ -34,7 +34,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Println(`ch10ctl <command> [options]
+	fmt.Print(`ch10ctl <command> [options]
 
 Commands:
   validate  --in <file> --profile <profile> --rules <rulepack.json> --tmats <file> --out <diagnostics.jsonl> --acceptance <acceptance.json>

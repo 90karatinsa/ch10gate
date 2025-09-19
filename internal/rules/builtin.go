@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"time"
 
-	"example.com/ch10gate/internal/ch10"
 	"example.com/ch10gate/internal/tmats"
 )
 
@@ -35,13 +34,19 @@ func (e *Engine) RegisterBuiltins() {
 }
 
 func CheckSyncPattern(ctx *Context, rule Rule) (Diagnostic, bool, error) {
-	hdr, _, err := ch10.ScanFileMin(ctx.InputFile)
-	if err != nil {
+	if err := ctx.EnsureFileIndex(); err != nil {
 		return Diagnostic{
 			Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: ERROR,
 			Message: "cannot parse first header", Refs: rule.Refs, FixSuggested: false,
 		}, false, err
 	}
+	if ctx.PrimaryHeader == nil {
+		return Diagnostic{
+			Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: ERROR,
+			Message: "no primary header found", Refs: rule.Refs, FixSuggested: false,
+		}, false, nil
+	}
+	hdr := *ctx.PrimaryHeader
 	if hdr.Sync != 0xEB25 {
 		return Diagnostic{
 			Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: ERROR,
@@ -97,10 +102,13 @@ func RenumberSeq(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 }
 
 func BlockUnknownDataType(ctx *Context, rule Rule) (Diagnostic, bool, error) {
-	hdr, _, err := ch10.ScanFileMin(ctx.InputFile)
-	if err != nil {
+	if err := ctx.EnsureFileIndex(); err != nil {
 		return Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: ERROR, Message: "cannot parse", Refs: rule.Refs}, false, err
 	}
+	if ctx.PrimaryHeader == nil {
+		return Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: ERROR, Message: "no primary header", Refs: rule.Refs}, false, nil
+	}
+	hdr := *ctx.PrimaryHeader
 	if hdr.DataType > 0x80 {
 		return Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: ERROR, Message: fmt.Sprintf("unknown data type 0x%X", hdr.DataType), Refs: rule.Refs}, false, nil
 	}
