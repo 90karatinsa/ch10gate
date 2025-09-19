@@ -613,11 +613,123 @@ func FixPCMAlign(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 }
 
 func Check1553IpdhLen(ctx *Context, rule Rule) (Diagnostic, bool, error) {
-	return Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: INFO, Message: "1553 IPDH len check deferred", Refs: rule.Refs}, false, nil
+	diag := Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: INFO, Message: "1553 16PP194 IPDH lengths verified", Refs: rule.Refs}
+	if ctx == nil {
+		diag.Severity = ERROR
+		diag.Message = "no context provided"
+		return diag, false, errors.New("nil context")
+	}
+	if err := ctx.EnsureFileIndex(); err != nil {
+		diag.Severity = ERROR
+		diag.Message = "cannot index file"
+		return diag, false, err
+	}
+	if ctx.Index == nil || len(ctx.Index.Packets) == 0 {
+		diag.Message = "no packets to inspect"
+		return diag, false, nil
+	}
+
+	var found bool
+	for i := range ctx.Index.Packets {
+		pkt := &ctx.Index.Packets[i]
+		if pkt.DataType != 0x19 {
+			continue
+		}
+		found = true
+		diag.PacketIndex = i
+		diag.ChannelId = int(pkt.ChannelID)
+		diag.Offset = fmt.Sprintf("0x%X", pkt.Offset)
+		if pkt.MIL1553 == nil {
+			diag.Severity = ERROR
+			diag.Message = "1553 payload details unavailable"
+			return diag, false, nil
+		}
+		info := pkt.MIL1553
+		if info.ParseError != "" {
+			diag.Severity = ERROR
+			diag.Message = fmt.Sprintf("cannot inspect 16PP194 IPDH (%s)", info.ParseError)
+			return diag, false, nil
+		}
+		for msgIdx, msg := range info.Messages {
+			if msg.IPDHLength != 0x18 {
+				diag.Severity = ERROR
+				diag.Message = fmt.Sprintf("%s (message %d length=0x%X)", rule.Message, msgIdx+1, msg.IPDHLength)
+				if pkt.TimeStampUs >= 0 {
+					diag.TimestampUs = int64Ptr(pkt.TimeStampUs)
+					src := string(pkt.Source)
+					diag.TimestampSource = stringPtr(src)
+				}
+				return diag, false, nil
+			}
+		}
+	}
+
+	if !found {
+		diag.Message = "no 16PP194 packets detected"
+	}
+	return diag, false, nil
 }
 
 func Warn1553Ttb(ctx *Context, rule Rule) (Diagnostic, bool, error) {
-	return Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: INFO, Message: "TTB warning (placeholder)", Refs: rule.Refs}, false, nil
+	diag := Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: INFO, Message: "1553 TTB values verified", Refs: rule.Refs}
+	if ctx == nil {
+		diag.Severity = ERROR
+		diag.Message = "no context provided"
+		return diag, false, errors.New("nil context")
+	}
+	if err := ctx.EnsureFileIndex(); err != nil {
+		diag.Severity = ERROR
+		diag.Message = "cannot index file"
+		return diag, false, err
+	}
+	if ctx.Index == nil || len(ctx.Index.Packets) == 0 {
+		diag.Message = "no packets to inspect"
+		return diag, false, nil
+	}
+
+	var found bool
+	for i := range ctx.Index.Packets {
+		pkt := &ctx.Index.Packets[i]
+		if pkt.DataType != 0x18 {
+			continue
+		}
+		found = true
+		if pkt.MIL1553 == nil {
+			diag.Severity = WARN
+			diag.PacketIndex = i
+			diag.ChannelId = int(pkt.ChannelID)
+			diag.Offset = fmt.Sprintf("0x%X", pkt.Offset)
+			diag.Message = "1553 CSDW not parsed"
+			return diag, false, nil
+		}
+		info := pkt.MIL1553
+		if info.ParseError != "" {
+			diag.Severity = WARN
+			diag.PacketIndex = i
+			diag.ChannelId = int(pkt.ChannelID)
+			diag.Offset = fmt.Sprintf("0x%X", pkt.Offset)
+			diag.Message = fmt.Sprintf("TTB not inspected (%s)", info.ParseError)
+			return diag, false, nil
+		}
+		if info.TTB == 0x3 {
+			diag.Severity = WARN
+			diag.PacketIndex = i
+			diag.ChannelId = int(pkt.ChannelID)
+			diag.Offset = fmt.Sprintf("0x%X", pkt.Offset)
+			diag.Message = fmt.Sprintf("%s (value=0x%X)", rule.Message, info.TTB)
+			if pkt.TimeStampUs >= 0 {
+				diag.TimestampUs = int64Ptr(pkt.TimeStampUs)
+				src := string(pkt.Source)
+				diag.TimestampSource = stringPtr(src)
+			}
+			return diag, false, nil
+		}
+	}
+
+	if !found {
+		diag.Message = "no MIL-STD-1553 format 1 packets detected"
+	}
+	return diag, false, nil
 }
 
 func FixA429Gap(ctx *Context, rule Rule) (Diagnostic, bool, error) {

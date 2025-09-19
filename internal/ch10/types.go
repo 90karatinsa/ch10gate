@@ -43,10 +43,29 @@ type PacketIndex struct {
 	TimeStampUs  int64
 	Source       TimestampSource
 	IsTimePacket bool
+	MIL1553      *MIL1553Info
 }
 
 type FileIndex struct {
 	Packets               []PacketIndex
 	HasTimePacket         bool
 	TimeSeenBeforeDynamic bool
+}
+
+type MIL1553Message struct {
+	IPTS            uint64
+	BlockStatusWord uint16
+	GapTimeWord     uint16
+	LengthWord      uint16
+	IPDHStatus      uint16
+	IPDHLength      uint16
+}
+
+type MIL1553Info struct {
+	Format       uint8
+	CSDW         uint32
+	TTB          uint8
+	MessageCount uint32
+	Messages     []MIL1553Message
+	ParseError   string
 }
