@@ -10,6 +10,14 @@ type PacketHeader struct {
 	Flags        uint8
 }
 
+type SecondaryHeader struct {
+	HasSecHdr   bool
+	TimeFormat  uint8
+	Seconds     uint32
+	Subsecond   uint32
+	TimeStampUs int64
+}
+
 type PacketIndex struct {
 	Offset       int64
 	ChannelID    uint16

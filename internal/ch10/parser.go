@@ -11,14 +11,23 @@ import (
 )
 
 const (
-	syncPattern         = 0xEB25
-	primaryHeaderSize   = 20
-	defaultResyncWindow = 64 * 1024
+	syncPattern           = 0xEB25
+	primaryHeaderSize     = 20
+	secondaryHeaderSize   = 12
+	secondaryTimeFieldLen = 8
+	defaultResyncWindow   = 64 * 1024
+
+	packetFlagTimeFormatMask = 0x0C
+	packetFlagSecondaryHdr   = 0x80
+
+	timeFormatIRIG106  = 0x00
+	timeFormatIEEE1588 = 0x04
 )
 
 var (
-	ErrNoSync             = errors.New("sync pattern 0xEB25 not found at expected position")
-	ErrUnsupportedProfile = errors.New("unsupported Chapter 10 profile")
+	ErrNoSync                = errors.New("sync pattern 0xEB25 not found at expected position")
+	ErrUnsupportedProfile    = errors.New("unsupported Chapter 10 profile")
+	ErrUnsupportedTimeFormat = errors.New("unsupported secondary header time format")
 )
 
 func ParsePrimaryHeader(r io.ReaderAt, offset int64) (PacketHeader, error) {
@@ -42,6 +51,49 @@ func ParsePrimaryHeader(r io.ReaderAt, offset int64) (PacketHeader, error) {
 	hdr.SeqNum = buf[14]
 	hdr.Flags = buf[15]
 	return hdr, nil
+}
+
+func parseSecHdrFlags(hdr *PacketHeader) (bool, uint8) {
+	if hdr == nil {
+		return false, 0
+	}
+	has := hdr.Flags&packetFlagSecondaryHdr != 0
+	tf := hdr.Flags & packetFlagTimeFormatMask
+	return has, tf
+}
+
+func decodeIPTSToMicros(tf uint8, raw []byte) (int64, SecondaryHeader, error) {
+	secondary := SecondaryHeader{HasSecHdr: true, TimeFormat: tf, TimeStampUs: -1}
+	if len(raw) < secondaryTimeFieldLen {
+		return -1, secondary, fmt.Errorf("timestamp too short: %d bytes", len(raw))
+	}
+	switch tf {
+	case timeFormatIRIG106:
+		high := binary.BigEndian.Uint16(raw[0:2])
+		low := binary.BigEndian.Uint16(raw[2:4])
+		usec := binary.BigEndian.Uint16(raw[4:6])
+		totalHundredths := uint64(high)*65536 + uint64(low)
+		seconds := totalHundredths / 100
+		hundredths := totalHundredths % 100
+		fractionalMicros := uint64(hundredths)*10_000 + uint64(usec)
+		if fractionalMicros >= 1_000_000 {
+			seconds += fractionalMicros / 1_000_000
+			fractionalMicros = fractionalMicros % 1_000_000
+		}
+		secondary.Seconds = uint32(seconds)
+		secondary.Subsecond = uint32(fractionalMicros)
+		secondary.TimeStampUs = int64(seconds*1_000_000 + fractionalMicros)
+		return secondary.TimeStampUs, secondary, nil
+	case timeFormatIEEE1588:
+		nanos := binary.BigEndian.Uint32(raw[0:4])
+		secs := binary.BigEndian.Uint32(raw[4:8])
+		secondary.Seconds = secs
+		secondary.Subsecond = nanos
+		secondary.TimeStampUs = int64(secs)*1_000_000 + int64(nanos)/1_000
+		return secondary.TimeStampUs, secondary, nil
+	default:
+		return -1, secondary, ErrUnsupportedTimeFormat
+	}
 }
 
 // Reader iterates across a Chapter 10 file sequentially while building an index
@@ -151,6 +203,7 @@ func (r *Reader) Next() (PacketHeader, PacketIndex, error) {
 			r.primarySet = true
 		}
 
+		hasSecHdr, timeFmt := parseSecHdrFlags(&hdr)
 		idx := PacketIndex{
 			Offset:       r.offset,
 			ChannelID:    hdr.ChannelID,
@@ -159,7 +212,34 @@ func (r *Reader) Next() (PacketHeader, PacketIndex, error) {
 			Flags:        hdr.Flags,
 			PacketLength: hdr.PacketLength,
 			DataLength:   hdr.DataLength,
+			HasSecHdr:    hasSecHdr,
+			TimeStampUs:  -1,
 		}
+
+		if hasSecHdr {
+			secOffset := r.offset + primaryHeaderSize
+			if secOffset+secondaryHeaderSize <= nextOffset && secOffset+secondaryHeaderSize <= r.size {
+				buf := make([]byte, secondaryTimeFieldLen)
+				if _, err := r.file.ReadAt(buf, secOffset); err == nil {
+					ts, secondary, err := decodeIPTSToMicros(timeFmt, buf)
+					if err != nil {
+						if errors.Is(err, ErrUnsupportedTimeFormat) {
+							common.Logf("packet at offset %d uses unsupported time format 0x%X", r.offset, timeFmt)
+						} else {
+							common.Logf("packet at offset %d timestamp decode failed: %v", r.offset, err)
+						}
+					} else {
+						idx.TimeStampUs = ts
+						idx.HasSecHdr = secondary.HasSecHdr
+					}
+				} else {
+					common.Logf("packet at offset %d timestamp read failed: %v", r.offset, err)
+				}
+			} else {
+				common.Logf("packet at offset %d missing secondary header bytes", r.offset)
+			}
+		}
+
 		r.index.Packets = append(r.index.Packets, idx)
 
 		r.offset = nextOffset
