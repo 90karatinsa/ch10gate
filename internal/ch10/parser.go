@@ -287,6 +287,18 @@ func (r *Reader) Next() (PacketHeader, PacketIndex, error) {
 			payloadLen = 0
 		}
 
+		if hdr.DataType == 0x18 || hdr.DataType == 0x19 {
+			info, err := parseMIL1553Payload(r.file, payloadOffset, payloadLen, hdr.DataType)
+			if err != nil {
+				common.Logf("1553 parse error at offset %d: %v", r.offset, err)
+			} else if info != nil {
+				if info.ParseError != "" {
+					common.Logf("1553 parse warning at offset %d: %s", r.offset, info.ParseError)
+				}
+				idx.MIL1553 = info
+			}
+		}
+
 		if isTime {
 			r.index.HasTimePacket = true
 			if idx.TimeStampUs < 0 && payloadLen >= int64(secondaryTimeFieldLen) {
@@ -407,6 +419,132 @@ func ScanFileMin(path string) (PacketHeader, FileIndex, error) {
 		return PacketHeader{}, idx, ErrNoSync
 	}
 	return hdr, idx, nil
+}
+
+func parseMIL1553Payload(r io.ReaderAt, offset int64, payloadLen int64, dataType uint16) (*MIL1553Info, error) {
+	var format uint8
+	switch dataType {
+	case 0x18:
+		format = 1
+	case 0x19:
+		format = 2
+	default:
+		return nil, nil
+	}
+
+	info := &MIL1553Info{Format: format}
+	if payloadLen <= 0 {
+		info.ParseError = "payload empty"
+		return info, nil
+	}
+	if payloadLen < 4 {
+		info.ParseError = "payload shorter than CSDW"
+		return info, nil
+	}
+
+	var csdwBuf [4]byte
+	n, err := r.ReadAt(csdwBuf[:], offset)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return info, err
+	}
+	if n < 4 {
+		info.ParseError = "payload shorter than CSDW"
+		return info, nil
+	}
+	info.CSDW = binary.BigEndian.Uint32(csdwBuf[:])
+	cursor := offset + 4
+	end := offset + payloadLen
+
+	switch format {
+	case 1:
+		info.TTB = uint8((info.CSDW >> 30) & 0x3)
+		info.MessageCount = info.CSDW & 0x00FFFFFF
+	case 2:
+		info.MessageCount = info.CSDW
+	}
+
+	for msgIdx := uint32(0); msgIdx < info.MessageCount; msgIdx++ {
+		if cursor+8 > end {
+			info.ParseError = fmt.Sprintf("message %d missing IPTS", msgIdx+1)
+			break
+		}
+		var iptsBuf [8]byte
+		n, err = r.ReadAt(iptsBuf[:], cursor)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return info, err
+		}
+		if n < 8 {
+			info.ParseError = fmt.Sprintf("message %d IPTS truncated", msgIdx+1)
+			break
+		}
+		msg := MIL1553Message{IPTS: binary.BigEndian.Uint64(iptsBuf[:])}
+		cursor += 8
+
+		switch format {
+		case 1:
+			if cursor+6 > end {
+				info.ParseError = fmt.Sprintf("message %d missing IPDH", msgIdx+1)
+				return info, nil
+			}
+			var ipdhBuf [6]byte
+			n, err = r.ReadAt(ipdhBuf[:], cursor)
+			if err != nil && !errors.Is(err, io.EOF) {
+				return info, err
+			}
+			if n < 6 {
+				info.ParseError = fmt.Sprintf("message %d IPDH truncated", msgIdx+1)
+				return info, nil
+			}
+			msg.BlockStatusWord = binary.BigEndian.Uint16(ipdhBuf[0:2])
+			msg.GapTimeWord = binary.BigEndian.Uint16(ipdhBuf[2:4])
+			msg.LengthWord = binary.BigEndian.Uint16(ipdhBuf[4:6])
+			cursor += 6
+			msgLen := int64(msg.LengthWord)
+			if msgLen < 0 {
+				info.ParseError = fmt.Sprintf("message %d length underflow", msgIdx+1)
+				return info, nil
+			}
+			if cursor+msgLen > end {
+				info.ParseError = fmt.Sprintf("message %d extends past payload", msgIdx+1)
+				return info, nil
+			}
+			info.Messages = append(info.Messages, msg)
+			cursor += msgLen
+		case 2:
+			if cursor+4 > end {
+				info.ParseError = fmt.Sprintf("message %d missing IPDH", msgIdx+1)
+				return info, nil
+			}
+			var ipdhBuf [4]byte
+			n, err = r.ReadAt(ipdhBuf[:], cursor)
+			if err != nil && !errors.Is(err, io.EOF) {
+				return info, err
+			}
+			if n < 4 {
+				info.ParseError = fmt.Sprintf("message %d IPDH truncated", msgIdx+1)
+				return info, nil
+			}
+			msg.IPDHStatus = binary.BigEndian.Uint16(ipdhBuf[0:2])
+			msg.IPDHLength = binary.BigEndian.Uint16(ipdhBuf[2:4])
+			cursor += 4
+			msgLen := int64(msg.IPDHLength)
+			if msgLen < 0 {
+				info.ParseError = fmt.Sprintf("message %d length underflow", msgIdx+1)
+				return info, nil
+			}
+			if cursor+msgLen > end {
+				info.ParseError = fmt.Sprintf("message %d extends past payload", msgIdx+1)
+				return info, nil
+			}
+			info.Messages = append(info.Messages, msg)
+			cursor += msgLen
+		}
+	}
+
+	if info.ParseError == "" && info.MessageCount != uint32(len(info.Messages)) {
+		info.ParseError = fmt.Sprintf("message count mismatch: expected %d, parsed %d", info.MessageCount, len(info.Messages))
+	}
+	return info, nil
 }
 
 // ComputeHeaderChecksum calculates the header checksum for the supplied
