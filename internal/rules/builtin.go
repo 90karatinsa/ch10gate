@@ -7,6 +7,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"example.com/ch10gate/internal/ch10"
@@ -1506,24 +1509,229 @@ func UpdateTMATSDigest(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 	if ctx.TMATSFile == "" {
 		return Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: WARN, Message: "no TMATS provided", Refs: rule.Refs}, false, nil
 	}
-	t, err := tmats.Parse(ctx.TMATSFile)
+	doc, err := tmats.Parse(ctx.TMATSFile)
 	if err != nil {
 		return Diagnostic{Ts: time.Now(), File: ctx.TMATSFile, RuleId: rule.RuleId, Severity: ERROR, Message: "TMATS parse failed", Refs: rule.Refs}, false, err
 	}
-	d, err := tmats.ComputeDigest(t)
+	digest, err := doc.ComputeDigest()
 	if err != nil {
 		return Diagnostic{Ts: time.Now(), File: ctx.TMATSFile, RuleId: rule.RuleId, Severity: ERROR, Message: "digest compute failed", Refs: rule.Refs}, false, err
 	}
-	out := tmats.WithDigest(t, d)
+	doc.Set("G\\SHA", digest)
 	outPath := ctx.TMATSFile + ".fixed"
-	if err := os.WriteFile(outPath, []byte(out), 0644); err != nil {
+	if err := os.WriteFile(outPath, []byte(doc.String()), 0644); err != nil {
 		return Diagnostic{Ts: time.Now(), File: ctx.TMATSFile, RuleId: rule.RuleId, Severity: ERROR, Message: "cannot write fixed TMATS", Refs: rule.Refs}, false, err
 	}
 	return Diagnostic{Ts: time.Now(), File: ctx.TMATSFile, RuleId: rule.RuleId, Severity: INFO, Message: "TMATS digest updated, wrote " + filepath.Base(outPath), Refs: rule.Refs, FixSuggested: true}, true, nil
 }
 
 func NormalizeTMATSChannelMap(ctx *Context, rule Rule) (Diagnostic, bool, error) {
-	return Diagnostic{Ts: time.Now(), File: ctx.TMATSFile, RuleId: rule.RuleId, Severity: INFO, Message: "TMATS channel map normalization deferred", Refs: rule.Refs}, false, nil
+	diag := Diagnostic{Ts: time.Now(), File: ctx.TMATSFile, RuleId: rule.RuleId, Severity: INFO, Message: "TMATS channel map normalization", Refs: rule.Refs}
+
+	if ctx == nil {
+		diag.Severity = ERROR
+		diag.Message = "no context provided"
+		return diag, false, errors.New("nil context")
+	}
+	if ctx.TMATSFile == "" {
+		diag.Severity = WARN
+		diag.Message = "no TMATS provided"
+		return diag, false, nil
+	}
+	doc, err := tmats.Parse(ctx.TMATSFile)
+	if err != nil {
+		diag.Severity = ERROR
+		diag.Message = "TMATS parse failed"
+		return diag, false, err
+	}
+	if ctx.Index == nil {
+		if err := ctx.EnsureFileIndex(); err != nil {
+			diag.Severity = ERROR
+			diag.Message = "cannot index Chapter 10 file"
+			return diag, false, err
+		}
+	}
+	if ctx.Index == nil || len(ctx.Index.Packets) == 0 {
+		diag.Message = "no Chapter 10 packets indexed"
+		return diag, false, nil
+	}
+
+	summaries := make(map[uint16]*tmatsChannelSummary)
+	for i := range ctx.Index.Packets {
+		pkt := ctx.Index.Packets[i]
+		summary, ok := summaries[pkt.ChannelID]
+		if !ok {
+			summary = newTMATSChannelSummary(pkt.ChannelID)
+			summaries[pkt.ChannelID] = summary
+		}
+		summary.addPacket(pkt)
+	}
+	if len(summaries) == 0 {
+		diag.Message = "no channels detected in Chapter 10"
+		return diag, false, nil
+	}
+
+	ids := make([]int, 0, len(summaries))
+	for id := range summaries {
+		ids = append(ids, int(id))
+	}
+	sort.Ints(ids)
+
+	recordGroup := inferTMATSRecordGroup(doc)
+	mapChanged := false
+
+	for i, id := range ids {
+		idx := i + 1
+		summary := summaries[uint16(id)]
+		keyCHE := fmt.Sprintf("%s\\CHE-%d", recordGroup, idx)
+		if doc.Set(keyCHE, strconv.Itoa(int(summary.channelID))) {
+			mapChanged = true
+		}
+
+		dtKey := fmt.Sprintf("%s\\CDT-%d", recordGroup, idx)
+		dtName := tmats.DataTypeName(summary.dataType())
+		if doc.Set(dtKey, dtName) {
+			mapChanged = true
+		}
+
+		shtfKey := fmt.Sprintf("%s\\SHTF-%d", recordGroup, idx)
+		if tf, ok := summary.timeFormat(); ok {
+			tfName := tmats.TimeFormatName(tf)
+			if doc.Set(shtfKey, tfName) {
+				mapChanged = true
+			}
+		} else {
+			if doc.Delete(shtfKey) {
+				mapChanged = true
+			}
+		}
+	}
+
+	if removeExtraIndexedKeys(doc, recordGroup, "CHE", len(ids)) {
+		mapChanged = true
+	}
+	if removeExtraIndexedKeys(doc, recordGroup, "CDT", len(ids)) {
+		mapChanged = true
+	}
+	if removeExtraIndexedKeys(doc, recordGroup, "SHTF", len(ids)) {
+		mapChanged = true
+	}
+
+	nsbKey := fmt.Sprintf("%s\\NSB", recordGroup)
+	if doc.Set(nsbKey, strconv.Itoa(len(ids))) {
+		mapChanged = true
+	}
+
+	digest, err := doc.ComputeDigest()
+	if err != nil {
+		diag.Severity = ERROR
+		diag.Message = "digest compute failed"
+		return diag, false, err
+	}
+
+	changed := mapChanged
+	if doc.Set("G\\SHA", digest) {
+		changed = true
+	}
+
+	if !changed {
+		diag.Message = "TMATS channel map already consistent with Chapter 10"
+		return diag, false, nil
+	}
+
+	outPath := ctx.TMATSFile + ".fixed"
+	if err := os.WriteFile(outPath, []byte(doc.String()), 0644); err != nil {
+		diag.Severity = ERROR
+		diag.Message = "cannot write fixed TMATS"
+		return diag, false, err
+	}
+
+	diag.Message = fmt.Sprintf("TMATS channel map normalized for %d channels, wrote %s", len(ids), filepath.Base(outPath))
+	diag.FixSuggested = true
+	return diag, true, nil
+}
+
+type tmatsChannelSummary struct {
+	channelID  uint16
+	dataCounts map[uint16]int
+	timeCounts map[uint8]int
+}
+
+func newTMATSChannelSummary(id uint16) *tmatsChannelSummary {
+	return &tmatsChannelSummary{
+		channelID:  id,
+		dataCounts: make(map[uint16]int),
+		timeCounts: make(map[uint8]int),
+	}
+}
+
+func (s *tmatsChannelSummary) addPacket(pkt ch10.PacketIndex) {
+	s.dataCounts[pkt.DataType]++
+	if pkt.HasSecHdr {
+		s.timeCounts[pkt.TimeFormat]++
+	}
+}
+
+func (s *tmatsChannelSummary) dataType() uint16 {
+	var best uint16
+	var bestCount int
+	for dt, count := range s.dataCounts {
+		if count > bestCount || (count == bestCount && dt < best) {
+			best = dt
+			bestCount = count
+		}
+	}
+	return best
+}
+
+func (s *tmatsChannelSummary) timeFormat() (uint8, bool) {
+	var best uint8
+	var bestCount int
+	for tf, count := range s.timeCounts {
+		if count > bestCount || (count == bestCount && tf < best) {
+			best = tf
+			bestCount = count
+		}
+	}
+	if bestCount == 0 {
+		return 0, false
+	}
+	return best, true
+}
+
+func inferTMATSRecordGroup(doc *tmats.Document) string {
+	if doc == nil {
+		return "R-1"
+	}
+	for _, key := range doc.Keys() {
+		if strings.HasPrefix(key, "R-") {
+			if idx := strings.Index(key, "\\"); idx > 0 {
+				return key[:idx]
+			}
+		}
+	}
+	return "R-1"
+}
+
+func removeExtraIndexedKeys(doc *tmats.Document, recordGroup, field string, keep int) bool {
+	if doc == nil {
+		return false
+	}
+	prefix := fmt.Sprintf("%s\\%s-", recordGroup, field)
+	changed := false
+	for _, key := range doc.KeysWithPrefix(prefix) {
+		idxStr := strings.TrimPrefix(key, prefix)
+		idx, err := strconv.Atoi(idxStr)
+		if err != nil {
+			continue
+		}
+		if idx > keep {
+			if doc.Delete(key) {
+				changed = true
+			}
+		}
+	}
+	return changed
 }
 
 func SyncSecondaryTimeFmt(ctx *Context, rule Rule) (Diagnostic, bool, error) {
