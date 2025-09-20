@@ -157,6 +157,8 @@ type Context struct {
 	Metrics  *common.Metrics
 	AuditLog *common.PatchLog
 
+	DryRun bool
+
 	DictionaryPath   string
 	Dictionaries     *dict.Store
 	DictionaryReport *DictionaryComplianceReport

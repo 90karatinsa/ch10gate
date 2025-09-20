@@ -2,8 +2,10 @@ package server
 
 import (
 	"crypto/rand"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"example.com/ch10gate/internal/crypto"
 	"example.com/ch10gate/internal/manifest"
 	"example.com/ch10gate/internal/report"
 	"example.com/ch10gate/internal/rules"
@@ -28,19 +31,12 @@ type Server struct {
 	artifacts       *ArtifactStore
 	workDir         string
 	uploadsDir      string
-	profilePack     map[string]string
+	profilePack     map[string]profilePackEntry
+	profiles        []string
 	concurrency     int
 	updateInstaller *update.Installer
 	enableAdmin     bool
-}
-
-// Options configures server creation.
-type Options struct {
-	StorageDir      string
-	ProfilePacks    map[string]string
-	Concurrency     int
-	EnableAdmin     bool
-	UpdateInstaller *update.Installer
+	manifestSigning *manifestSigningState
 }
 
 // Artifact represents a file generated or stored by the daemon.
@@ -68,6 +64,44 @@ type ArtifactStore struct {
 	entries map[string]Artifact
 }
 
+type manifestSigningState struct {
+	privateKey  []byte
+	certSubject string
+	certIssuer  string
+}
+
+func loadManifestSigning(opts ManifestSigningOptions) (*manifestSigningState, error) {
+	keyPath := strings.TrimSpace(opts.PrivateKeyPath)
+	certPath := strings.TrimSpace(opts.CertificatePath)
+	if keyPath == "" && certPath == "" {
+		return nil, nil
+	}
+	if keyPath == "" || certPath == "" {
+		return nil, errors.New("manifest signing requires both private key and certificate paths")
+	}
+	keyBytes, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("read manifest private key: %w", err)
+	}
+	certBytes, err := os.ReadFile(certPath)
+	if err != nil {
+		return nil, fmt.Errorf("read manifest certificate: %w", err)
+	}
+	block, _ := pem.Decode(certBytes)
+	if block == nil {
+		return nil, errors.New("manifest certificate is not PEM encoded")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse manifest certificate: %w", err)
+	}
+	return &manifestSigningState{
+		privateKey:  keyBytes,
+		certSubject: cert.Subject.String(),
+		certIssuer:  cert.Issuer.String(),
+	}, nil
+}
+
 // NewServer constructs a Server rooted at a temporary workspace directory.
 func NewServer(opts Options) (*Server, error) {
 	storageDir := opts.StorageDir
@@ -86,27 +120,30 @@ func NewServer(opts Options) (*Server, error) {
 		os.RemoveAll(workDir)
 		return nil, err
 	}
+	profilePack, profiles, err := buildProfilePackMap(opts)
+	if err != nil {
+		os.RemoveAll(workDir)
+		return nil, err
+	}
+	signer, err := loadManifestSigning(opts.ManifestSigning)
+	if err != nil {
+		os.RemoveAll(workDir)
+		return nil, err
+	}
 	concurrency := opts.Concurrency
 	if concurrency <= 0 {
 		concurrency = runtime.NumCPU()
-	}
-	profilePack := map[string]string{
-		"106-15": filepath.Join("profiles", "106-15", "rules-min.json"),
-	}
-	for profile, pack := range opts.ProfilePacks {
-		if strings.TrimSpace(profile) == "" || strings.TrimSpace(pack) == "" {
-			continue
-		}
-		profilePack[profile] = pack
 	}
 	s := &Server{
 		artifacts:       &ArtifactStore{entries: make(map[string]Artifact)},
 		workDir:         workDir,
 		uploadsDir:      uploadsDir,
 		profilePack:     profilePack,
+		profiles:        profiles,
 		concurrency:     concurrency,
 		updateInstaller: opts.UpdateInstaller,
 		enableAdmin:     opts.EnableAdmin,
+		manifestSigning: signer,
 	}
 	return s, nil
 }
@@ -419,35 +456,37 @@ func (s *Server) handleAutoFix(w http.ResponseWriter, r *http.Request) {
 	engine := rules.NewEngine(rp)
 	engine.RegisterBuiltins()
 	engine.SetConcurrency(1)
-	ctx := &rules.Context{InputFile: inputPath, TMATSFile: tmatsPath, Profile: req.Profile}
+	ctx := &rules.Context{InputFile: inputPath, TMATSFile: tmatsPath, Profile: req.Profile, DryRun: req.DryRun}
 	diags, err := engine.Eval(ctx)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("eval: %v", err), http.StatusInternalServerError)
 		return
 	}
-	seen := make(map[string]struct{})
 	var outputs []ArtifactRef
-	for _, d := range diags {
-		if !d.FixApplied || d.FixPatchId == "" {
-			continue
+	if !req.DryRun {
+		seen := make(map[string]struct{})
+		for _, d := range diags {
+			if !d.FixApplied || d.FixPatchId == "" {
+				continue
+			}
+			dir := filepath.Dir(d.File)
+			if dir == "" {
+				dir = filepath.Dir(inputPath)
+			}
+			candidate := filepath.Join(dir, d.FixPatchId)
+			if _, ok := seen[candidate]; ok {
+				continue
+			}
+			if _, err := os.Stat(candidate); err != nil {
+				continue
+			}
+			art, err := s.addArtifact(candidate, d.FixPatchId, "", "autofix")
+			if err != nil {
+				continue
+			}
+			seen[candidate] = struct{}{}
+			outputs = append(outputs, toRef(art))
 		}
-		dir := filepath.Dir(d.File)
-		if dir == "" {
-			dir = filepath.Dir(inputPath)
-		}
-		candidate := filepath.Join(dir, d.FixPatchId)
-		if _, ok := seen[candidate]; ok {
-			continue
-		}
-		if _, err := os.Stat(candidate); err != nil {
-			continue
-		}
-		art, err := s.addArtifact(candidate, d.FixPatchId, "", "autofix")
-		if err != nil {
-			continue
-		}
-		seen[candidate] = struct{}{}
-		outputs = append(outputs, toRef(art))
 	}
 	resp := struct {
 		Diagnostics []rules.Diagnostic `json:"diagnostics"`
@@ -467,6 +506,7 @@ func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Inputs  []string `json:"inputs"`
 		ShaAlgo string   `json:"shaAlgo"`
+		Sign    bool     `json:"sign"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, fmt.Sprintf("invalid json: %v", err), http.StatusBadRequest)
@@ -497,6 +537,21 @@ func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("build manifest: %v", err), http.StatusInternalServerError)
 		return
 	}
+	if req.ShaAlgo != "" {
+		m.ShaAlgo = strings.ToLower(req.ShaAlgo)
+	}
+	if req.Sign {
+		if s.manifestSigning == nil {
+			http.Error(w, "manifest signing unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		m.Signature = &manifest.Signature{
+			Type:          "jws-detached",
+			CertSubject:   s.manifestSigning.certSubject,
+			Issuer:        s.manifestSigning.certIssuer,
+			SignatureFile: "manifest.jws",
+		}
+	}
 	outPath, err := s.tempPath("manifest-*.json")
 	if err != nil {
 		http.Error(w, fmt.Sprintf("manifest temp: %v", err), http.StatusInternalServerError)
@@ -511,12 +566,53 @@ func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("register manifest: %v", err), http.StatusInternalServerError)
 		return
 	}
+	var sigRef *ArtifactRef
+	if req.Sign {
+		payload, err := os.ReadFile(outPath)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("read manifest: %v", err), http.StatusInternalServerError)
+			return
+		}
+		jws, err := crypto.SignDetachedJWS(payload, s.manifestSigning.privateKey)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("sign manifest: %v", err), http.StatusInternalServerError)
+			return
+		}
+		sigPath, err := s.tempPath("manifest-*.jws")
+		if err != nil {
+			http.Error(w, fmt.Sprintf("signature temp: %v", err), http.StatusInternalServerError)
+			return
+		}
+		sigBytes, err := json.MarshalIndent(jws, "", "  ")
+		if err != nil {
+			http.Error(w, fmt.Sprintf("marshal signature: %v", err), http.StatusInternalServerError)
+			return
+		}
+		if err := os.WriteFile(sigPath, sigBytes, 0o644); err != nil {
+			http.Error(w, fmt.Sprintf("write signature: %v", err), http.StatusInternalServerError)
+			return
+		}
+		sigArt, err := s.addArtifact(sigPath, "manifest.jws", "application/jose+json", "manifest-signature")
+		if err != nil {
+			http.Error(w, fmt.Sprintf("register signature: %v", err), http.StatusInternalServerError)
+			return
+		}
+		ref := toRef(sigArt)
+		sigRef = &ref
+	}
+	manifestRef := toRef(art)
 	resp := struct {
-		Manifest manifest.Manifest `json:"manifest"`
-		Artifact ArtifactRef       `json:"artifact"`
+		Manifest          manifest.Manifest `json:"manifest"`
+		ManifestArtifact  ArtifactRef       `json:"manifestArtifact"`
+		SignatureArtifact *ArtifactRef      `json:"signatureArtifact,omitempty"`
+		Artifact          ArtifactRef       `json:"artifact"`
 	}{
-		Manifest: m,
-		Artifact: toRef(art),
+		Manifest:         m,
+		ManifestArtifact: manifestRef,
+		Artifact:         manifestRef,
+	}
+	if sigRef != nil {
+		resp.SignatureArtifact = sigRef
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -526,8 +622,7 @@ func (s *Server) handleProfiles(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	profiles := []string{"106-09", "106-11", "106-13", "106-15", "106-20"}
-	writeJSON(w, http.StatusOK, profiles)
+	writeJSON(w, http.StatusOK, append([]string(nil), s.profiles...))
 }
 
 func (s *Server) handleArtifactDownload(w http.ResponseWriter, r *http.Request) {
@@ -643,11 +738,11 @@ func (s *Server) loadRulePack(profile string, override *rules.RulePack) (rules.R
 	if override != nil && len(override.Rules) > 0 {
 		return *override, nil
 	}
-	path, ok := s.profilePack[profile]
+	pack, ok := s.profilePack[profile]
 	if !ok {
 		return rules.RulePack{}, fmt.Errorf("no default rule pack for profile %s", profile)
 	}
-	return rules.LoadRulePack(path)
+	return rules.LoadRulePack(pack.rulesPath)
 }
 
 func toRef(art Artifact) ArtifactRef {

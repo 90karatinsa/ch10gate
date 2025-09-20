@@ -1,4 +1,16 @@
-# Minimal TMATS sample (demo only)
+# CH10 Gate sample TMATS (generated)
+# Regenerate with `go generate ./examples`
+G\DSI:ch10gate deterministic sample;
+G\DSF:examples/cmd/generate_samples;
+R-1\ID:Gate Bundle Demo;
+R-1\NOF:3;
 R-1\CHE-1:1;
-R-1\CDT-1:1553;
-G\SHA:placeholder;
+R-1\CDT-1:TIME;
+R-1\DSI-1:Primary time reference;
+R-1\CHE-2:2;
+R-1\CDT-2:PCM;
+R-1\DSI-2:IPTS payload (2500 us);
+R-1\CHE-3:3;
+R-1\CDT-3:PCM;
+R-1\DSI-3:Secondary header timestamp;
+G\SHA:6bd445ba0228d0312ea8b0cab1f24ff76025cda819862d711135dd1bd00e1ee6;

@@ -1,7 +1,7 @@
 {
-  "rulePackId": "starter-106-15",
+  "rulePackId": "starter-106-20",
   "version": "1.0.0",
-  "profile": "106-15",
+  "profile": "106-20",
   "rules": [
     {
       "ruleId": "RP-0001",
@@ -129,7 +129,9 @@
       "scope": "packet",
       "stage": "type-specific",
       "appliesTo": {
-        "dataTypes": [8]
+        "dataTypes": [
+          8
+        ]
       },
       "severity": "ERROR",
       "fixable": true,
@@ -145,7 +147,9 @@
       "scope": "packet",
       "stage": "type-specific",
       "appliesTo": {
-        "dataTypes": [25]
+        "dataTypes": [
+          25
+        ]
       },
       "severity": "ERROR",
       "fixable": false,
@@ -161,7 +165,9 @@
       "scope": "packet",
       "stage": "type-specific",
       "appliesTo": {
-        "dataTypes": [24]
+        "dataTypes": [
+          24
+        ]
       },
       "severity": "WARN",
       "fixable": false,
@@ -190,7 +196,9 @@
       "scope": "packet",
       "stage": "type-specific",
       "appliesTo": {
-        "dataTypes": [56]
+        "dataTypes": [
+          56
+        ]
       },
       "severity": "WARN",
       "fixable": false,
@@ -219,7 +227,9 @@
       "scope": "packet",
       "stage": "type-specific",
       "appliesTo": {
-        "dataTypes": [81]
+        "dataTypes": [
+          81
+        ]
       },
       "severity": "ERROR",
       "fixable": true,

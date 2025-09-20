@@ -113,10 +113,11 @@ cp -R "${ROOT_DIR}/deploy" "${BUNDLE_DIR}/"
 echo "[gate-bundle] preparing example assets"
 EXAMPLES_DIR="${BUNDLE_DIR}/examples"
 mkdir -p "${EXAMPLES_DIR}/dicts"
-cp "${ROOT_DIR}/examples/sample.tmats" "${EXAMPLES_DIR}/sample.tmats"
-cp "${ROOT_DIR}/examples/sample.ch10" "${EXAMPLES_DIR}/sample.ch10"
 cp "${ROOT_DIR}/examples/README.txt" "${EXAMPLES_DIR}/README.txt"
 cp "${ROOT_DIR}/examples/dicts/"*.json "${EXAMPLES_DIR}/dicts/"
+
+echo "[gate-bundle] generating sample Chapter 10 capture"
+go run "${ROOT_DIR}/examples/cmd/generate_samples" -out "${EXAMPLES_DIR}" >/dev/null
 
 export BUNDLE_DIR VERSION BUILD_DATE REVISION BUNDLE_NAME
 

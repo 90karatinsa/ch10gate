@@ -453,10 +453,12 @@ function renderAcceptance(summary) {
     summaryBox.append(heading, list);
 }
 
-function collectArtifacts(summary, manifest) {
+function collectArtifacts(summary, manifestArtifacts) {
     const artifacts = Array.isArray(summary?.artifacts) ? [...summary.artifacts] : [];
-    if (manifest) {
-        artifacts.push(manifest);
+    if (Array.isArray(manifestArtifacts)) {
+        artifacts.push(...manifestArtifacts);
+    } else if (manifestArtifacts) {
+        artifacts.push(manifestArtifacts);
     }
     return artifacts;
 }
@@ -502,7 +504,16 @@ async function requestManifest() {
             throw new Error(text || `manifest failed (${response.status})`);
         }
         const payload = await response.json();
-        return payload?.artifact ?? null;
+        const manifestArtifact = payload?.manifestArtifact ?? payload?.artifact ?? null;
+        const signatureArtifact = payload?.signatureArtifact ?? null;
+        const artifacts = [];
+        if (manifestArtifact) {
+            artifacts.push(manifestArtifact);
+        }
+        if (signatureArtifact) {
+            artifacts.push(signatureArtifact);
+        }
+        return artifacts;
     } catch (error) {
         logMessage(`Manifest build failed: ${error.message}`, "error");
         return null;

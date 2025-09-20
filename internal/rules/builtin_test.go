@@ -98,107 +98,207 @@ func TestCheckSyncPattern(t *testing.T) {
 }
 
 func TestFixHeaderChecksum(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "header.ch10")
-	payload := []byte{0x01, 0x02, 0x03, 0x04}
-	packet := buildSyntheticPacket(t, "106-15", 1, 0x08, 0, 0, nil, payload)
-	binary.BigEndian.PutUint16(packet[16:18], 0xFFFF)
-	writeSyntheticFile(t, path, packet)
-
-	ctx := &Context{InputFile: path, Profile: "106-15"}
 	rule := Rule{RuleId: "RP-0002"}
-	diag, applied, err := FixHeaderChecksum(ctx, rule)
-	if err != nil {
-		t.Fatalf("FixHeaderChecksum err: %v", err)
-	}
-	if !applied {
-		t.Fatalf("expected checksum fix applied")
-	}
-	if !strings.Contains(diag.Message, "fixed header checksum") {
-		t.Fatalf("unexpected diag message: %+v", diag)
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read fixed file: %v", err)
-	}
-	want := buildSyntheticPacket(t, "106-15", 1, 0x08, 0, 0, nil, payload)
-	got := binary.BigEndian.Uint16(data[16:18])
-	if got != binary.BigEndian.Uint16(want[16:18]) {
-		t.Fatalf("checksum not corrected: got 0x%04X want 0x%04X", got, binary.BigEndian.Uint16(want[16:18]))
-	}
 
-	_, _, err = FixHeaderChecksum(&Context{}, rule)
-	if err == nil {
+	t.Run("apply", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "header.ch10")
+		payload := []byte{0x01, 0x02, 0x03, 0x04}
+		packet := buildSyntheticPacket(t, "106-15", 1, 0x08, 0, 0, nil, payload)
+		binary.BigEndian.PutUint16(packet[16:18], 0xFFFF)
+		writeSyntheticFile(t, path, packet)
+
+		ctx := &Context{InputFile: path, Profile: "106-15"}
+		diag, applied, err := FixHeaderChecksum(ctx, rule)
+		if err != nil {
+			t.Fatalf("FixHeaderChecksum err: %v", err)
+		}
+		if !applied {
+			t.Fatalf("expected checksum fix applied")
+		}
+		if !strings.Contains(diag.Message, "fixed header checksum") {
+			t.Fatalf("unexpected diag message: %+v", diag)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read fixed file: %v", err)
+		}
+		want := buildSyntheticPacket(t, "106-15", 1, 0x08, 0, 0, nil, payload)
+		got := binary.BigEndian.Uint16(data[16:18])
+		if got != binary.BigEndian.Uint16(want[16:18]) {
+			t.Fatalf("checksum not corrected: got 0x%04X want 0x%04X", got, binary.BigEndian.Uint16(want[16:18]))
+		}
+	})
+
+	t.Run("dry-run", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "header.ch10")
+		payload := []byte{0xAA, 0xBB, 0xCC, 0xDD}
+		packet := buildSyntheticPacket(t, "106-15", 2, 0x08, 0, 0, nil, payload)
+		binary.BigEndian.PutUint16(packet[16:18], 0xFFFF)
+		writeSyntheticFile(t, path, packet)
+
+		ctx := &Context{InputFile: path, Profile: "106-15", DryRun: true}
+		diag, applied, err := FixHeaderChecksum(ctx, rule)
+		if err != nil {
+			t.Fatalf("FixHeaderChecksum dry-run err: %v", err)
+		}
+		if applied {
+			t.Fatalf("expected no fix applied during dry-run")
+		}
+		if !diag.FixSuggested {
+			t.Fatalf("expected fix suggested during dry-run: %+v", diag)
+		}
+		if !strings.Contains(diag.Message, "would fix header checksum") {
+			t.Fatalf("unexpected dry-run message: %+v", diag)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read original file: %v", err)
+		}
+		if binary.BigEndian.Uint16(data[16:18]) != 0xFFFF {
+			t.Fatalf("checksum should remain unchanged during dry-run")
+		}
+	})
+
+	if _, _, err := FixHeaderChecksum(&Context{}, rule); err == nil {
 		t.Fatalf("expected error when input file missing")
 	}
 }
 
 func TestFixDataChecksumOrTrailer(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "data.ch10")
-	payload := []byte{0x10, 0x20, 0x30, 0x40}
-	packet := buildSyntheticPacket(t, "106-15", 2, 0x08, 0, 0, nil, payload)
-	binary.BigEndian.PutUint16(packet[18:20], 0)
-	writeSyntheticFile(t, path, packet)
-
-	ctx := &Context{InputFile: path, Profile: "106-15"}
 	rule := Rule{RuleId: "RP-0003"}
-	diag, applied, err := FixDataChecksumOrTrailer(ctx, rule)
-	if err != nil {
-		t.Fatalf("FixDataChecksumOrTrailer err: %v", err)
-	}
-	if !applied {
-		t.Fatalf("expected checksum fix applied")
-	}
-	if !strings.Contains(diag.Message, "data checksum") {
-		t.Fatalf("unexpected diag message: %+v", diag)
-	}
-	want := computeDataChecksum(t, "106-15", payload)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read fixed file: %v", err)
-	}
-	if binary.BigEndian.Uint16(data[18:20]) != want {
-		t.Fatalf("data checksum not corrected")
-	}
 
-	_, _, err = FixDataChecksumOrTrailer(&Context{}, rule)
-	if err == nil {
+	t.Run("apply", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "data.ch10")
+		payload := []byte{0x10, 0x20, 0x30, 0x40}
+		packet := buildSyntheticPacket(t, "106-15", 2, 0x08, 0, 0, nil, payload)
+		binary.BigEndian.PutUint16(packet[18:20], 0)
+		writeSyntheticFile(t, path, packet)
+
+		ctx := &Context{InputFile: path, Profile: "106-15"}
+		diag, applied, err := FixDataChecksumOrTrailer(ctx, rule)
+		if err != nil {
+			t.Fatalf("FixDataChecksumOrTrailer err: %v", err)
+		}
+		if !applied {
+			t.Fatalf("expected checksum fix applied")
+		}
+		if !strings.Contains(diag.Message, "data checksum") {
+			t.Fatalf("unexpected diag message: %+v", diag)
+		}
+		want := computeDataChecksum(t, "106-15", payload)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read fixed file: %v", err)
+		}
+		if binary.BigEndian.Uint16(data[18:20]) != want {
+			t.Fatalf("data checksum not corrected")
+		}
+	})
+
+	t.Run("dry-run", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "data.ch10")
+		payload := []byte{0x55, 0x66, 0x77, 0x88}
+		packet := buildSyntheticPacket(t, "106-15", 4, 0x08, 0, 0, nil, payload)
+		binary.BigEndian.PutUint16(packet[18:20], 0)
+		writeSyntheticFile(t, path, packet)
+
+		ctx := &Context{InputFile: path, Profile: "106-15", DryRun: true}
+		diag, applied, err := FixDataChecksumOrTrailer(ctx, rule)
+		if err != nil {
+			t.Fatalf("FixDataChecksumOrTrailer dry-run err: %v", err)
+		}
+		if applied {
+			t.Fatalf("expected no fix applied during dry-run")
+		}
+		if !diag.FixSuggested {
+			t.Fatalf("expected fix suggested during dry-run: %+v", diag)
+		}
+		if !strings.Contains(diag.Message, "would fix data checksum") {
+			t.Fatalf("unexpected dry-run message: %+v", diag)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read original file: %v", err)
+		}
+		if binary.BigEndian.Uint16(data[18:20]) != 0 {
+			t.Fatalf("data checksum should remain unchanged during dry-run")
+		}
+	})
+
+	if _, _, err := FixDataChecksumOrTrailer(&Context{}, rule); err == nil {
 		t.Fatalf("expected error when input file missing")
 	}
 }
 
 func TestFixLengths(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "lengths.ch10")
-	payload := []byte{0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44}
-	packet := buildSyntheticPacket(t, "106-15", 3, 0x00, 0, 0, nil, payload)
-	binary.BigEndian.PutUint32(packet[8:12], uint32(len(payload)/2))
-	binary.BigEndian.PutUint16(packet[18:20], 0)
-	writeSyntheticFile(t, path, packet)
-
-	ctx := &Context{InputFile: path, Profile: "106-15"}
 	rule := Rule{RuleId: "RP-0005"}
-	diag, applied, err := FixLengths(ctx, rule)
-	if err != nil {
-		t.Fatalf("FixLengths err: %v", err)
-	}
-	if !applied {
-		t.Fatalf("expected length fix applied")
-	}
-	if !strings.Contains(diag.Message, "length") {
-		t.Fatalf("unexpected diag message: %+v", diag)
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read fixed file: %v", err)
-	}
-	if binary.BigEndian.Uint32(data[8:12]) != uint32(len(payload)) {
-		t.Fatalf("data length not corrected")
-	}
 
-	_, _, err = FixLengths(&Context{}, rule)
-	if err == nil {
+	t.Run("apply", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "lengths.ch10")
+		payload := []byte{0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44}
+		packet := buildSyntheticPacket(t, "106-15", 3, 0x00, 0, 0, nil, payload)
+		binary.BigEndian.PutUint32(packet[8:12], uint32(len(payload)/2))
+		binary.BigEndian.PutUint16(packet[18:20], 0)
+		writeSyntheticFile(t, path, packet)
+
+		ctx := &Context{InputFile: path, Profile: "106-15"}
+		diag, applied, err := FixLengths(ctx, rule)
+		if err != nil {
+			t.Fatalf("FixLengths err: %v", err)
+		}
+		if !applied {
+			t.Fatalf("expected length fix applied")
+		}
+		if !strings.Contains(diag.Message, "length") {
+			t.Fatalf("unexpected diag message: %+v", diag)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read fixed file: %v", err)
+		}
+		if binary.BigEndian.Uint32(data[8:12]) != uint32(len(payload)) {
+			t.Fatalf("data length not corrected")
+		}
+	})
+
+	t.Run("dry-run", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "lengths.ch10")
+		payload := []byte{0x01, 0x02, 0x03, 0x04}
+		packet := buildSyntheticPacket(t, "106-15", 4, 0x00, 0, 0, nil, payload)
+		binary.BigEndian.PutUint32(packet[8:12], uint32(len(payload)/2))
+		binary.BigEndian.PutUint16(packet[18:20], 0)
+		writeSyntheticFile(t, path, packet)
+
+		ctx := &Context{InputFile: path, Profile: "106-15", DryRun: true}
+		diag, applied, err := FixLengths(ctx, rule)
+		if err != nil {
+			t.Fatalf("FixLengths dry-run err: %v", err)
+		}
+		if applied {
+			t.Fatalf("expected no fix applied during dry-run")
+		}
+		if !diag.FixSuggested {
+			t.Fatalf("expected fix suggested during dry-run: %+v", diag)
+		}
+		if !strings.Contains(diag.Message, "would update length fields") {
+			t.Fatalf("unexpected dry-run message: %+v", diag)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read original file: %v", err)
+		}
+		if binary.BigEndian.Uint32(data[8:12]) == uint32(len(payload)) {
+			t.Fatalf("data length should remain incorrect during dry-run")
+		}
+	})
+
+	if _, _, err := FixLengths(&Context{}, rule); err == nil {
 		t.Fatalf("expected error when input file missing")
 	}
 }
