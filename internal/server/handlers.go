@@ -28,6 +28,14 @@ type Server struct {
 	workDir     string
 	uploadsDir  string
 	profilePack map[string]string
+	concurrency int
+}
+
+// Options configures server creation.
+type Options struct {
+	StorageDir   string
+	ProfilePacks map[string]string
+	Concurrency  int
 }
 
 // Artifact represents a file generated or stored by the daemon.
@@ -56,8 +64,15 @@ type ArtifactStore struct {
 }
 
 // NewServer constructs a Server rooted at a temporary workspace directory.
-func NewServer() (*Server, error) {
-	workDir, err := os.MkdirTemp("", "ch10d-")
+func NewServer(opts Options) (*Server, error) {
+	storageDir := opts.StorageDir
+	if storageDir == "" {
+		storageDir = os.TempDir()
+	}
+	if err := os.MkdirAll(storageDir, 0o755); err != nil {
+		return nil, err
+	}
+	workDir, err := os.MkdirTemp(storageDir, "ch10d-")
 	if err != nil {
 		return nil, err
 	}
@@ -66,13 +81,25 @@ func NewServer() (*Server, error) {
 		os.RemoveAll(workDir)
 		return nil, err
 	}
+	concurrency := opts.Concurrency
+	if concurrency <= 0 {
+		concurrency = runtime.NumCPU()
+	}
+	profilePack := map[string]string{
+		"106-15": filepath.Join("profiles", "106-15", "rules-min.json"),
+	}
+	for profile, pack := range opts.ProfilePacks {
+		if strings.TrimSpace(profile) == "" || strings.TrimSpace(pack) == "" {
+			continue
+		}
+		profilePack[profile] = pack
+	}
 	s := &Server{
-		artifacts:  &ArtifactStore{entries: make(map[string]Artifact)},
-		workDir:    workDir,
-		uploadsDir: uploadsDir,
-		profilePack: map[string]string{
-			"106-15": filepath.Join("profiles", "106-15", "rules-min.json"),
-		},
+		artifacts:   &ArtifactStore{entries: make(map[string]Artifact)},
+		workDir:     workDir,
+		uploadsDir:  uploadsDir,
+		profilePack: profilePack,
+		concurrency: concurrency,
 	}
 	return s, nil
 }
@@ -192,7 +219,7 @@ func (s *Server) handleValidate(w http.ResponseWriter, r *http.Request) {
 	}
 	engine := rules.NewEngine(rp)
 	engine.RegisterBuiltins()
-	engine.SetConcurrency(runtime.NumCPU())
+	engine.SetConcurrency(s.concurrency)
 	includeTimestamps := true
 	if req.IncludeTimestamps != nil {
 		includeTimestamps = *req.IncludeTimestamps

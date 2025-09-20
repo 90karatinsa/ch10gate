@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/ch10d/config.schema.json",
+  "title": "ch10d configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "port",
+    "storageDir",
+    "concurrency",
+    "defaultProfile",
+    "defaultRulePack",
+    "lang"
+  ],
+  "properties": {
+    "port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "storageDir": {
+      "type": "string",
+      "minLength": 1
+    },
+    "concurrency": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "defaultProfile": {
+      "type": "string",
+      "minLength": 1
+    },
+    "defaultRulePack": {
+      "type": "string",
+      "minLength": 1
+    },
+    "lang": {
+      "type": "string",
+      "minLength": 2
+    },
+    "logs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "directory"
+      ],
+      "properties": {
+        "directory": {
+          "type": "string",
+          "minLength": 1
+        },
+        "maxSizeMB": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "maxAgeDays": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "maxBackups": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "compress": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}
