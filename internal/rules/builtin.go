@@ -13,7 +13,21 @@ import (
 	"example.com/ch10gate/internal/tmats"
 )
 
-const ch10PrimaryHeaderSize = 20
+const (
+	ch10PrimaryHeaderSize   = 20
+	ch10SecondaryHeaderSize = 12
+)
+
+const (
+	pcmBitIPH         = uint32(1) << 30
+	pcmBitMajorFrame  = uint32(1) << 29
+	pcmBitMinorFrame  = uint32(1) << 28
+	pcmBitAlignment32 = uint32(1) << 21
+	pcmBitThroughput  = uint32(1) << 20
+	pcmBitPacked      = uint32(1) << 19
+	pcmBitUnpacked    = uint32(1) << 18
+	pcmMaskSyncOffset = uint32(0x3FFFF)
+)
 
 func int64Ptr(v int64) *int64 { return &v }
 
@@ -608,8 +622,263 @@ func EnsureTimePacket(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 	return diag, false, nil
 }
 
+func pcmChecksumLength(flags uint8) int {
+	switch flags & 0x3 {
+	case 1:
+		return 1
+	case 2:
+		return 2
+	case 3:
+		return 4
+	default:
+		return 0
+	}
+}
+
+func normalizePCMCSDW(info *ch10.PCMInfo) uint32 {
+	if info == nil {
+		return 0
+	}
+	hasIPH := info.HasIPH
+	major := info.MajorFrame
+	minor := info.MinorFrame
+	minorStatus := info.MinorStatus
+	majorStatus := info.MajorStatus
+	throughput := info.Throughput
+	packed := info.Packed
+	unpacked := info.Unpacked
+	syncOffset := info.SyncOffset
+
+	if !hasIPH && !throughput {
+		throughput = true
+	}
+	if throughput {
+		packed = false
+		unpacked = false
+		hasIPH = false
+		major = false
+		minor = false
+		minorStatus = 0
+		majorStatus = 0
+		syncOffset = 0
+	} else {
+		hasIPH = true
+		if packed && unpacked {
+			if syncOffset != 0 {
+				packed = false
+				unpacked = true
+			} else {
+				packed = true
+				unpacked = false
+			}
+		} else if !packed && !unpacked {
+			if syncOffset != 0 {
+				unpacked = true
+			} else {
+				packed = true
+			}
+		}
+		if packed {
+			syncOffset = 0
+		}
+	}
+
+	var csdw uint32
+	if hasIPH {
+		csdw |= pcmBitIPH
+	}
+	if major && !throughput {
+		csdw |= pcmBitMajorFrame
+	}
+	if minor && !throughput {
+		csdw |= pcmBitMinorFrame
+	}
+	if !throughput {
+		csdw |= uint32(minorStatus&0x3) << 26
+		csdw |= uint32(majorStatus&0x3) << 24
+	}
+	if info.AlignmentBits == 32 {
+		csdw |= pcmBitAlignment32
+	}
+	if throughput {
+		csdw |= pcmBitThroughput
+	}
+	if packed {
+		csdw |= pcmBitPacked
+	}
+	if unpacked {
+		csdw |= pcmBitUnpacked
+	}
+	csdw |= syncOffset & pcmMaskSyncOffset
+	return csdw
+}
+
 func FixPCMAlign(ctx *Context, rule Rule) (Diagnostic, bool, error) {
-	return Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: WARN, Message: "PCM alignment fix not implemented", Refs: rule.Refs}, false, ErrNotImplemented
+	diag := Diagnostic{
+		Ts:       time.Now(),
+		File:     ctx.InputFile,
+		RuleId:   rule.RuleId,
+		Severity: INFO,
+		Message:  "PCM alignment verified",
+		Refs:     rule.Refs,
+	}
+	if ctx == nil || ctx.InputFile == "" {
+		diag.Severity = ERROR
+		diag.Message = "no input file provided"
+		return diag, false, errors.New("no input file")
+	}
+	if ctx.Index == nil {
+		if err := ctx.EnsureFileIndex(); err != nil {
+			diag.Severity = ERROR
+			diag.Message = "cannot index file"
+			return diag, false, err
+		}
+	}
+	if ctx.Index == nil || len(ctx.Index.Packets) == 0 {
+		diag.Message = "no packets to inspect"
+		return diag, false, nil
+	}
+
+	f, err := os.Open(ctx.InputFile)
+	if err != nil {
+		diag.Severity = ERROR
+		diag.Message = "cannot open input file"
+		return diag, false, err
+	}
+	defer f.Close()
+
+	var edits []ch10.PatchEdit
+	var headerFixes, fillerFixes int
+	modifiedPackets := 0
+	modified := make(map[int]struct{})
+	firstFixIdx := -1
+	var firstPkt *ch10.PacketIndex
+
+	for i := range ctx.Index.Packets {
+		pkt := &ctx.Index.Packets[i]
+		if pkt.DataType != 0x08 {
+			continue
+		}
+
+		payloadOffset := pkt.Offset + ch10PrimaryHeaderSize
+		secLen := 0
+		if pkt.HasSecHdr {
+			payloadOffset += int64(ch10SecondaryHeaderSize)
+			secLen = ch10SecondaryHeaderSize
+		}
+
+		dataLen := int(pkt.DataLength)
+		if dataLen < 0 {
+			dataLen = 0
+		}
+		if pkt.HasSecHdr {
+			if dataLen >= ch10SecondaryHeaderSize {
+				dataLen -= ch10SecondaryHeaderSize
+			} else {
+				dataLen = 0
+			}
+		}
+
+		totalLen := int(pkt.PacketLength) + 4
+		trailerLen := totalLen - ch10PrimaryHeaderSize - secLen - dataLen
+		if trailerLen < 0 {
+			trailerLen = 0
+		}
+		checksumLen := pcmChecksumLength(pkt.Flags)
+		if checksumLen > trailerLen {
+			checksumLen = trailerLen
+		}
+		fillerLen := trailerLen - checksumLen
+		if fillerLen < 0 {
+			fillerLen = 0
+		}
+		fillerOffset := payloadOffset + int64(dataLen)
+
+		pcmInfo := pkt.PCM
+		if pcmInfo == nil && dataLen >= 4 {
+			var csdwBuf [4]byte
+			if _, err := f.ReadAt(csdwBuf[:], payloadOffset); err == nil {
+				decoded := ch10.DecodePCMCSDW(binary.BigEndian.Uint32(csdwBuf[:]))
+				pcmInfo = &decoded
+			}
+		}
+		if pcmInfo == nil {
+			continue
+		}
+
+		newCsdw := normalizePCMCSDW(pcmInfo)
+		if newCsdw != pcmInfo.CSDW {
+			var buf [4]byte
+			binary.BigEndian.PutUint32(buf[:], newCsdw)
+			edits = append(edits, ch10.PatchEdit{Offset: payloadOffset, Data: buf[:]})
+			headerFixes++
+			if _, seen := modified[i]; !seen {
+				modified[i] = struct{}{}
+				modifiedPackets++
+			}
+			if firstFixIdx < 0 {
+				firstFixIdx = i
+				firstPkt = pkt
+			}
+		}
+
+		if fillerLen > 0 {
+			filler := make([]byte, fillerLen)
+			if _, err := f.ReadAt(filler, fillerOffset); err != nil && !errors.Is(err, io.EOF) {
+				diag.Severity = ERROR
+				diag.Message = fmt.Sprintf("cannot read PCM filler at offset 0x%X", fillerOffset)
+				return diag, false, err
+			}
+			valid := true
+			for _, b := range filler {
+				if b != 0x00 && b != 0xFF {
+					valid = false
+					break
+				}
+			}
+			if !valid {
+				replacement := make([]byte, fillerLen)
+				edits = append(edits, ch10.PatchEdit{Offset: fillerOffset, Data: replacement})
+				fillerFixes++
+				if _, seen := modified[i]; !seen {
+					modified[i] = struct{}{}
+					modifiedPackets++
+				}
+				if firstFixIdx < 0 {
+					firstFixIdx = i
+					firstPkt = pkt
+				}
+			}
+		}
+	}
+
+	if headerFixes == 0 && fillerFixes == 0 {
+		var pcmCount int
+		for _, pkt := range ctx.Index.Packets {
+			if pkt.DataType == 0x08 {
+				pcmCount++
+			}
+		}
+		if pcmCount == 0 {
+			diag.Message = "no PCM Format 1 packets detected"
+		}
+		return diag, false, nil
+	}
+
+	if err := ch10.ApplyPatch(ctx.InputFile, edits); err != nil {
+		diag.Severity = ERROR
+		diag.Message = "failed to apply PCM alignment fixes"
+		return diag, false, err
+	}
+
+	diag.FixSuggested = true
+	diag.Message = fmt.Sprintf("fixed PCM alignment on %d packet(s) (%d header, %d filler)", modifiedPackets, headerFixes, fillerFixes)
+	if firstFixIdx >= 0 && firstPkt != nil {
+		diag.PacketIndex = firstFixIdx
+		diag.ChannelId = int(firstPkt.ChannelID)
+		diag.Offset = fmt.Sprintf("0x%X", firstPkt.Offset)
+	}
+	return diag, true, nil
 }
 
 func Check1553IpdhLen(ctx *Context, rule Rule) (Diagnostic, bool, error) {

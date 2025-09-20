@@ -418,3 +418,48 @@ func writeTestPacket(t *testing.T, f *os.File, dataType uint16, flags uint8, sec
 		}
 	}
 }
+
+func TestDecodePCMCSDW(t *testing.T) {
+	csdw := uint32(0)
+	csdw |= 1 << 31
+	csdw |= 1 << 30
+	csdw |= 1 << 29
+	csdw |= 1 << 28
+	csdw |= uint32(3) << 26
+	csdw |= uint32(2) << 24
+	csdw |= uint32(2) << 22
+	csdw |= 1 << 21
+	csdw |= 1 << 20
+	csdw |= 1 << 19
+	csdw |= 1 << 18
+	csdw |= 0x12345
+
+	info := DecodePCMCSDW(csdw)
+	if !info.HasIPH {
+		t.Fatalf("HasIPH = false, want true")
+	}
+	if !info.MajorFrame || !info.MinorFrame {
+		t.Fatalf("frame indicators not set: major=%v minor=%v", info.MajorFrame, info.MinorFrame)
+	}
+	if info.MinorStatus != 3 || info.MajorStatus != 2 {
+		t.Fatalf("lock status mismatch: minor=%d major=%d", info.MinorStatus, info.MajorStatus)
+	}
+	if info.AlignmentBits != 32 {
+		t.Fatalf("AlignmentBits = %d, want 32", info.AlignmentBits)
+	}
+	if !info.Throughput || !info.Packed || !info.Unpacked {
+		t.Fatalf("mode bits incorrect: throughput=%v packed=%v unpacked=%v", info.Throughput, info.Packed, info.Unpacked)
+	}
+	if info.Mode != PCMModeUnknown {
+		t.Fatalf("Mode = %v, want PCMModeUnknown", info.Mode)
+	}
+	if !info.ModeConflict {
+		t.Fatalf("ModeConflict = false, want true")
+	}
+	if !info.ReservedNonZero {
+		t.Fatalf("ReservedNonZero = false, want true")
+	}
+	if info.SyncOffset != 0x12345&pcmMaskSyncOffset {
+		t.Fatalf("SyncOffset = 0x%X, want 0x%X", info.SyncOffset, 0x12345&pcmMaskSyncOffset)
+	}
+}
