@@ -282,6 +282,21 @@
         "10.11.3/5"
       ],
       "message": "File should have .ch10/.tf10 extension"
+    },
+    {
+      "ruleId": "RP-0021",
+      "name": "DirectoryChain",
+      "scope": "file",
+      "stage": "struct-write",
+      "severity": "ERROR",
+      "fixable": true,
+      "fixFunction": "ValidateOrRebuildDirectory",
+      "refs": [
+        "10.5.2",
+        "10.11.5",
+        "10.11.6"
+      ],
+      "message": "Transfer/directory files must contain a valid directory chain"
     }
   ]
 }

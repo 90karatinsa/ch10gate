@@ -656,6 +656,66 @@ func RewriteWithPlan(srcPath, dstPath, profile string, idx *FileIndex, plan *Str
 	return out.Sync()
 }
 
+// RewriteTransferFileWithDirectory rewrites the transfer file at srcPath to dstPath using
+// the provided directory image while preserving the original data bytes beginning at
+// dataOffset.
+func RewriteTransferFileWithDirectory(srcPath, dstPath string, dir DirectoryImage, dataOffset int64) error {
+	dirBytes, err := dir.Marshal()
+	if err != nil {
+		return err
+	}
+	if int64(len(dirBytes)) != dataOffset {
+		return fmt.Errorf("directory length %d does not match data offset %d", len(dirBytes), dataOffset)
+	}
+	in, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dstPath)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		out.Sync()
+		out.Close()
+	}()
+	if _, err := out.Write(dirBytes); err != nil {
+		return err
+	}
+	if _, err := in.Seek(dataOffset, io.SeekStart); err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return nil
+}
+
+// CopyChapter10Data writes the Chapter 10 byte range beginning at offset to dstPath.
+func CopyChapter10Data(srcPath, dstPath string, offset int64) error {
+	in, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	if _, err := in.Seek(offset, io.SeekStart); err != nil {
+		return err
+	}
+	out, err := os.Create(dstPath)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		out.Sync()
+		out.Close()
+	}()
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return nil
+}
+
 type rewriteState struct {
 	plan    *StructuralPlan
 	nextSeq map[uint16]uint8
