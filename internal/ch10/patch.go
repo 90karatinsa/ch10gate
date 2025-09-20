@@ -24,6 +24,26 @@ type InsertEdit struct {
 	Note         string
 }
 
+// PacketInsert describes a full packet to insert before a packet index.
+type PacketInsert struct {
+	// BeforeIndex indicates the packet index in the existing file before
+	// which the new packet should be written. Values less than zero insert
+	// at the start of the file, while values greater than the number of
+	// packets append to the end.
+	BeforeIndex int
+	Packet      []byte
+}
+
+// StructuralPlan captures high level structural mutations applied while
+// rewriting a Chapter 10 recording.
+type StructuralPlan struct {
+	Inserts          []PacketInsert
+	Deletes          map[int]struct{}
+	ChannelRemap     map[uint16]uint16
+	RenumberAll      bool
+	RenumberChannels map[uint16]bool
+}
+
 // ApplyPatch applies the provided edits to path. Each edit must stay within the
 // bounds of the file and does not change its length.
 func ApplyPatch(path string, edits []PatchEdit) error {
@@ -537,4 +557,187 @@ func computeSecondaryHeaderChecksum(sec []byte) uint16 {
 		sum = (sum & 0xFFFF) + (sum >> 16)
 	}
 	return uint16(sum & 0xFFFF)
+}
+
+// RewriteWithPlan rewrites the Chapter 10 file at srcPath according to the
+// provided structural plan and writes the result to dstPath. The supplied index
+// must describe the packets in srcPath.
+func RewriteWithPlan(srcPath, dstPath, profile string, idx *FileIndex, plan *StructuralPlan) error {
+	if idx == nil {
+		return errors.New("no index available")
+	}
+	if plan == nil {
+		return errors.New("no plan provided")
+	}
+	in, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dstPath)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		out.Sync()
+		out.Close()
+	}()
+
+	before := make(map[int][]PacketInsert)
+	packetCount := len(idx.Packets)
+	for _, ins := range plan.Inserts {
+		target := ins.BeforeIndex
+		if target < 0 {
+			target = 0
+		} else if target > packetCount {
+			target = packetCount
+		}
+		if len(ins.Packet) == 0 {
+			continue
+		}
+		before[target] = append(before[target], PacketInsert{BeforeIndex: target, Packet: ins.Packet})
+	}
+
+	state := newRewriteState(plan)
+
+	writePacket := func(packet []byte) error {
+		if len(packet) < primaryHeaderSize {
+			return fmt.Errorf("packet shorter than primary header: %d", len(packet))
+		}
+		buf := make([]byte, len(packet))
+		copy(buf, packet)
+		if err := state.apply(profile, buf[:primaryHeaderSize]); err != nil {
+			return err
+		}
+		_, err := out.Write(buf)
+		return err
+	}
+
+	for i := 0; i < packetCount; i++ {
+		if inserts := before[i]; len(inserts) > 0 {
+			for _, ins := range inserts {
+				if err := writePacket(ins.Packet); err != nil {
+					return err
+				}
+			}
+		}
+		if plan.Deletes != nil {
+			if _, skip := plan.Deletes[i]; skip {
+				continue
+			}
+		}
+		pkt := idx.Packets[i]
+		totalLen := int64(pkt.PacketLength) + 4
+		section := io.NewSectionReader(in, pkt.Offset, totalLen)
+		buf := make([]byte, totalLen)
+		if _, err := io.ReadFull(section, buf); err != nil {
+			return err
+		}
+		if len(buf) < primaryHeaderSize {
+			return fmt.Errorf("packet %d shorter than primary header", i)
+		}
+		if err := state.apply(profile, buf[:primaryHeaderSize]); err != nil {
+			return err
+		}
+		if _, err := out.Write(buf); err != nil {
+			return err
+		}
+	}
+
+	if inserts := before[packetCount]; len(inserts) > 0 {
+		for _, ins := range inserts {
+			if err := writePacket(ins.Packet); err != nil {
+				return err
+			}
+		}
+	}
+
+	return out.Sync()
+}
+
+type rewriteState struct {
+	plan    *StructuralPlan
+	nextSeq map[uint16]uint8
+}
+
+func newRewriteState(plan *StructuralPlan) *rewriteState {
+	return &rewriteState{plan: plan, nextSeq: make(map[uint16]uint8)}
+}
+
+func (p *StructuralPlan) shouldRenumber(channel uint16) bool {
+	if p == nil {
+		return false
+	}
+	if p.RenumberAll {
+		return true
+	}
+	if len(p.RenumberChannels) == 0 {
+		return false
+	}
+	return p.RenumberChannels[channel]
+}
+
+func (s *rewriteState) apply(profile string, header []byte) error {
+	if len(header) < primaryHeaderSize {
+		return fmt.Errorf("header too short: %d", len(header))
+	}
+	channel := binary.BigEndian.Uint16(header[2:4])
+	if s.plan != nil && s.plan.ChannelRemap != nil {
+		if newID, ok := s.plan.ChannelRemap[channel]; ok {
+			channel = newID
+			binary.BigEndian.PutUint16(header[2:4], newID)
+		}
+	}
+
+	if s.plan != nil && s.plan.shouldRenumber(channel) {
+		seq := s.nextSeq[channel]
+		header[14] = seq
+		s.nextSeq[channel] = seq + 1
+	} else {
+		seq := header[14]
+		s.nextSeq[channel] = seq + 1
+	}
+
+	header[16] = 0
+	header[17] = 0
+	checksum, err := ComputeHeaderChecksum(profile, header)
+	if err != nil {
+		return err
+	}
+	binary.BigEndian.PutUint16(header[16:18], checksum)
+	return nil
+}
+
+// BuildTimePacket constructs a minimal time data packet using the supplied
+// parameters. The payload encodes the provided timestamp using the requested
+// time format when possible.
+func BuildTimePacket(profile string, channelID uint16, timeFormat uint8, timestampUs int64) ([]byte, error) {
+	payload := make([]byte, secondaryTimeFieldLen)
+	if timestampUs >= 0 {
+		if encoded, err := encodeSecondaryHeaderTime(timeFormat, timestampUs); err == nil && len(encoded) == len(payload) {
+			copy(payload, encoded)
+		}
+	}
+
+	header := make([]byte, primaryHeaderSize)
+	binary.BigEndian.PutUint16(header[0:2], syncPattern)
+	binary.BigEndian.PutUint16(header[2:4], channelID)
+	binary.BigEndian.PutUint32(header[4:8], uint32(primaryHeaderSize+len(payload)-4))
+	binary.BigEndian.PutUint32(header[8:12], uint32(len(payload)))
+	binary.BigEndian.PutUint16(header[12:14], 0x0000)
+	header[14] = 0
+	header[15] = timeFormat & packetFlagTimeFormatMask
+	header[16] = 0
+	header[17] = 0
+	checksum, err := ComputeHeaderChecksum(profile, header)
+	if err != nil {
+		return nil, err
+	}
+	binary.BigEndian.PutUint16(header[16:18], checksum)
+
+	packet := make([]byte, len(header)+len(payload))
+	copy(packet, header)
+	copy(packet[len(header):], payload)
+	return packet, nil
 }
