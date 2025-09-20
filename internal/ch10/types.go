@@ -120,3 +120,29 @@ type PCMInfo struct {
 	ReservedNonZero bool
 	ParseError      string
 }
+
+type EthernetFrameView struct {
+	Index       int
+	HasIPH      bool
+	IPHOffset   int
+	FrameOffset int
+	FrameLength int
+	FrameIDWord uint32
+}
+
+type A664MessageView struct {
+	Index            int
+	IPHOffset        int
+	IPHLength        int
+	IPDHWord1        uint32
+	PayloadLength    int
+	DataOffset       int
+	MessageLength    int
+	IPv4Offset       int
+	IPv4HeaderLength int
+	IPv4TotalLength  int
+	UDPOffset        int
+	UDPLength        uint16
+	UDPChecksum      uint16
+	Proto            uint8
+}

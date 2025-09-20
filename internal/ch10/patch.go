@@ -1,6 +1,7 @@
 package ch10
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -13,6 +14,14 @@ import (
 type PatchEdit struct {
 	Offset int64
 	Data   []byte
+}
+
+// InsertEdit represents an insertion operation within a packet body.
+type InsertEdit struct {
+	PacketOffset int64
+	InsertAt     int
+	Bytes        []byte
+	Note         string
 }
 
 // ApplyPatch applies the provided edits to path. Each edit must stay within the
@@ -69,6 +78,144 @@ func ApplyPatch(path string, edits []PatchEdit) error {
 		}
 	}
 	return f.Sync()
+}
+
+// RewriteWithInsertions rewrites packets in srcPath by inserting byte sequences
+// at the specified body-relative offsets. The resulting file is written to
+// dstPath. Header packet/data length fields and the header checksum are updated
+// to account for the inserted bytes.
+func RewriteWithInsertions(srcPath, dstPath, profile string, edits []InsertEdit) error {
+	filtered := make([]InsertEdit, 0, len(edits))
+	for _, e := range edits {
+		if len(e.Bytes) == 0 {
+			continue
+		}
+		filtered = append(filtered, e)
+	}
+	if len(filtered) == 0 {
+		return errors.New("no insertions provided")
+	}
+	sort.SliceStable(filtered, func(i, j int) bool {
+		if filtered[i].PacketOffset == filtered[j].PacketOffset {
+			return filtered[i].InsertAt < filtered[j].InsertAt
+		}
+		return filtered[i].PacketOffset < filtered[j].PacketOffset
+	})
+
+	in, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dstPath)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		out.Sync()
+		out.Close()
+	}()
+
+	info, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	size := info.Size()
+	var (
+		editIdx int
+		offset  int64
+	)
+	header := make([]byte, primaryHeaderSize)
+	for offset < size {
+		if _, err := in.ReadAt(header, offset); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return err
+		}
+		packetLength := int64(binary.BigEndian.Uint32(header[4:8])) + 4
+		if packetLength < primaryHeaderSize {
+			return fmt.Errorf("packet at offset %d shorter than header", offset)
+		}
+		packet := make([]byte, packetLength)
+		if _, err := in.ReadAt(packet, offset); err != nil {
+			if !errors.Is(err, io.EOF) || int64(len(packet)) != packetLength {
+				return err
+			}
+		}
+		dataLength := int(binary.BigEndian.Uint32(packet[8:12]))
+		hasSecHdr := packet[15]&packetFlagSecondaryHdr != 0
+		secHdrLen := 0
+		if hasSecHdr {
+			secHdrLen = secondaryHeaderSize
+		}
+		dataStart := primaryHeaderSize + secHdrLen
+		dataEnd := dataStart + dataLength
+		if dataEnd > len(packet) {
+			dataEnd = len(packet)
+		}
+		if dataStart > len(packet) {
+			dataStart = len(packet)
+		}
+		body := packet[dataStart:dataEnd]
+
+		var packetEdits []InsertEdit
+		for editIdx < len(filtered) && filtered[editIdx].PacketOffset == offset {
+			packetEdits = append(packetEdits, filtered[editIdx])
+			editIdx++
+		}
+		if len(packetEdits) == 0 {
+			if _, err := out.Write(packet); err != nil {
+				return err
+			}
+			offset += packetLength
+			continue
+		}
+
+		originalBodyLen := len(body)
+		buf := bytes.NewBuffer(make([]byte, 0, originalBodyLen))
+		cursor := 0
+		for _, ins := range packetEdits {
+			if ins.InsertAt < 0 || ins.InsertAt > originalBodyLen {
+				return fmt.Errorf("insert position %d out of range for packet at %d", ins.InsertAt, offset)
+			}
+			if ins.InsertAt < cursor {
+				return fmt.Errorf("insert positions must be non-decreasing for packet at %d", offset)
+			}
+			buf.Write(body[cursor:ins.InsertAt])
+			buf.Write(ins.Bytes)
+			cursor = ins.InsertAt
+		}
+		buf.Write(body[cursor:])
+		newBody := buf.Bytes()
+
+		newPacket := make([]byte, 0, len(packet)-len(body)+len(newBody))
+		newPacket = append(newPacket, packet[:dataStart]...)
+		newPacket = append(newPacket, newBody...)
+		newPacket = append(newPacket, packet[dataEnd:]...)
+
+		newDataLen := uint32(len(newBody) + secHdrLen)
+		newPacketLen := uint32(len(newPacket) - 4)
+		binary.BigEndian.PutUint32(newPacket[4:8], newPacketLen)
+		binary.BigEndian.PutUint32(newPacket[8:12], newDataLen)
+		newPacket[16] = 0
+		newPacket[17] = 0
+		checksum, err := ComputeHeaderChecksum(profile, newPacket[:primaryHeaderSize])
+		if err != nil {
+			return err
+		}
+		binary.BigEndian.PutUint16(newPacket[16:18], checksum)
+
+		if _, err := out.Write(newPacket); err != nil {
+			return err
+		}
+		offset += packetLength
+	}
+	if editIdx != len(filtered) {
+		return fmt.Errorf("not all insertions applied (%d of %d)", editIdx, len(filtered))
+	}
+	return nil
 }
 
 // RewriteA429WithSplits rewrites the Chapter 10 file at path by splitting the

@@ -90,7 +90,48 @@ func validateCmd(args []string) {
 }
 
 func autofixCmd(args []string) {
-	validateCmd(args)
+	fs := flag.NewFlagSet("autofix", flag.ExitOnError)
+	in := fs.String("in", "", "input .ch10")
+	tmats := fs.String("tmats", "", "TMATS file")
+	profile := fs.String("profile", "106-15", "profile")
+	rulesPath := fs.String("rules", "", "rulepack.json")
+	includeTimestamps := fs.Bool("diag-include-timestamps", true, "include timestamp metadata in diagnostics output")
+	fs.Parse(args)
+
+	if *in == "" || *rulesPath == "" {
+		fmt.Println("required: --in, --rules")
+		os.Exit(1)
+	}
+
+	rp, err := rules.LoadRulePack(*rulesPath)
+	if err != nil {
+		fmt.Println("load rulepack:", err)
+		os.Exit(1)
+	}
+	engine := rules.NewEngine(rp)
+	engine.RegisterBuiltins()
+	engine.SetConfigValue("diag.include_timestamps", *includeTimestamps)
+
+	ctx := &rules.Context{InputFile: *in, TMATSFile: *tmats, Profile: *profile}
+	diags, err := engine.Eval(ctx)
+	if err != nil {
+		fmt.Println("eval:", err)
+		os.Exit(1)
+	}
+
+	fixes := 0
+	for _, d := range diags {
+		if !d.FixApplied {
+			continue
+		}
+		fixes++
+		if d.FixPatchId != "" {
+			fmt.Printf("%s: wrote %s\n", d.RuleId, d.FixPatchId)
+		}
+	}
+	if fixes == 0 {
+		fmt.Println("No fixes applied")
+	}
 }
 
 func reportCmd(args []string) {
