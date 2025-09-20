@@ -71,6 +71,7 @@ func (e *Engine) RegisterBuiltins() {
 	e.Register("UpdateTMATSDigest", UpdateTMATSDigest)
 	e.Register("NormalizeTMATSChannelMap", NormalizeTMATSChannelMap)
 	e.Register("SyncSecondaryTimeFmt", SyncSecondaryTimeFmt)
+	e.Register("ValidateOrRebuildDirectory", ValidateOrRebuildDirectory)
 	e.Register("FixFileExtension", FixFileExtension)
 }
 
@@ -2132,6 +2133,124 @@ func FixFileExtension(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 		return Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: ERROR, Message: "cannot copy with .ch10", Refs: rule.Refs}, false, err
 	}
 	return Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: INFO, Message: "copied to " + filepath.Base(newPath), Refs: rule.Refs, FixSuggested: true}, true, nil
+}
+
+func ValidateOrRebuildDirectory(ctx *Context, rule Rule) (Diagnostic, bool, error) {
+	diag := Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: INFO, Message: "directory inspection", Refs: rule.Refs}
+	if ctx == nil || ctx.InputFile == "" {
+		diag.Severity = ERROR
+		diag.Message = "no input file provided"
+		return diag, false, errors.New("no input file")
+	}
+	ext := strings.ToLower(filepath.Ext(ctx.InputFile))
+	if ext != ".tf10" && ext != ".df10" {
+		diag.Message = "not a transfer/directory file"
+		return diag, false, nil
+	}
+	info, err := os.Stat(ctx.InputFile)
+	if err != nil {
+		diag.Severity = ERROR
+		diag.Message = "cannot stat input file"
+		return diag, false, err
+	}
+	img, err := ch10.ReadDirectoryImage(ctx.InputFile)
+	if err != nil {
+		diag.Severity = ERROR
+		diag.Message = fmt.Sprintf("cannot parse directory: %v", err)
+		return diag, false, err
+	}
+	if err := ch10.ValidateDirectory(img, info.Size()); err == nil {
+		diag.Message = "directory chain valid"
+		return diag, false, nil
+	}
+
+	dataOffset := ch10.DeriveDataOffset(img)
+	if dataOffset <= 0 || dataOffset > info.Size() {
+		if candidate, ferr := ch10.FindFirstPacketOffset(ctx.InputFile); ferr == nil {
+			dataOffset = candidate
+		} else {
+			dataOffset = img.TotalBytes()
+		}
+	}
+	if dataOffset < img.TotalBytes() {
+		dataOffset = img.TotalBytes()
+	}
+	blockSize := img.BlockSize
+	if blockSize == 0 || dataOffset%int64(blockSize) != 0 {
+		blockSize = ch10.SelectBlockSize(dataOffset)
+	}
+
+	plan := ch10.BuildDirectoryPlanFromImage(img, info.Size())
+	plan.BlockSize = blockSize
+	plan.Shutdown = 0xFF
+	if len(plan.VolumeName) == 0 {
+		plan.VolumeName = ch10.BaseNameFromPath(ctx.InputFile)
+	}
+	if len(plan.Entries) == 0 {
+		size := info.Size() - dataOffset
+		if size < 0 {
+			size = 0
+		}
+		name := ch10.BaseNameFromPath(ctx.InputFile) + ".ch10"
+		plan.Entries = []ch10.DirectoryBuildEntry{{
+			Name:        name,
+			StartOffset: dataOffset,
+			Size:        size,
+		}}
+	} else {
+		for i := range plan.Entries {
+			if plan.Entries[i].Size < 0 {
+				plan.Entries[i].Size = 0
+			}
+			if plan.Entries[i].StartOffset < dataOffset {
+				dataOffset = plan.Entries[i].StartOffset
+			}
+		}
+		if dataOffset < img.TotalBytes() {
+			dataOffset = img.TotalBytes()
+		}
+	}
+
+	newDir, err := ch10.BuildDirectory(plan, dataOffset)
+	if err != nil {
+		diag.Severity = ERROR
+		diag.Message = fmt.Sprintf("cannot build directory: %v", err)
+		return diag, false, err
+	}
+
+	base := strings.TrimSuffix(ctx.InputFile, ext)
+	outPath := base + ".fixed" + ext
+	if err := ch10.RewriteTransferFileWithDirectory(ctx.InputFile, outPath, newDir, dataOffset); err != nil {
+		diag.Severity = ERROR
+		diag.Message = fmt.Sprintf("failed to rewrite %s", filepath.Base(outPath))
+		return diag, false, err
+	}
+
+	var additional []string
+	if dataOffset < info.Size() {
+		ch10Out := base + ".fixed.ch10"
+		if err := ch10.CopyChapter10Data(ctx.InputFile, ch10Out, dataOffset); err == nil {
+			additional = append(additional, filepath.Base(ch10Out))
+		}
+	}
+
+	diag.FixSuggested = true
+	diag.FixApplied = true
+	diag.FixPatchId = filepath.Base(outPath)
+	message := fmt.Sprintf("rebuilt directory (blockSize=%d, entries=%d) -> %s", plan.BlockSize, len(plan.Entries), filepath.Base(outPath))
+	if len(additional) > 0 {
+		message += fmt.Sprintf(", extracted %s", strings.Join(additional, ", "))
+	}
+	diag.Message = message
+
+	if tmatsPath, err := annotateTMATSModified(ctx, rule, "Directory rebuilt"); err != nil {
+		diag.Severity = WARN
+		diag.Message += fmt.Sprintf(" (TMATS update failed: %v)", err)
+	} else if tmatsPath != "" {
+		diag.Message += fmt.Sprintf(", updated TMATS %s", filepath.Base(tmatsPath))
+	}
+
+	return diag, true, nil
 }
 
 func copyFile(src, dst string) error {
