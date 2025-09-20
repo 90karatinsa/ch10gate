@@ -19,10 +19,20 @@ import (
 	"example.com/ch10gate/internal/rules"
 )
 
+var (
+	version   = "dev"
+	buildDate = "unknown"
+)
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
 		return
+	}
+	if _, err := common.RequireValidLicense(); err != nil {
+		fmt.Fprintf(os.Stderr, "license error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "machine hash: %s\n", machineHashForError())
+		os.Exit(2)
 	}
 	cmd := os.Args[1]
 	switch cmd {
@@ -44,7 +54,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Print(`ch10ctl <command> [options]
+	fmt.Printf(`ch10ctl %s (built %s) <command> [options]
 
 Commands:
   validate  --in <file> --profile <profile> --rules <rulepack.json> --tmats <file> --out <diagnostics.jsonl> --acceptance <acceptance.json>
@@ -53,7 +63,15 @@ Commands:
   manifest  --inputs <comma-separated> --out <manifest.json> [--sign --key <key.pem> --cert <cert.pem> --jws-out <file>]
   verify-signature --manifest <manifest.json> --jws <signature.jws> --cert <cert.pem>
   batch     --in <dir> --profile <profile> --rules <rulepack.json> --out-dir <dir>
-`)
+`, version, buildDate)
+}
+
+func machineHashForError() string {
+	hash, err := common.MachineFingerprint()
+	if err != nil {
+		return fmt.Sprintf("unavailable (%v)", err)
+	}
+	return hash
 }
 
 func validateCmd(args []string) {
