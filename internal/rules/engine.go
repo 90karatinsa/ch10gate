@@ -14,6 +14,7 @@ import (
 
 	"example.com/ch10gate/internal/ch10"
 	"example.com/ch10gate/internal/common"
+	"example.com/ch10gate/internal/dict"
 )
 
 type Severity string
@@ -111,8 +112,38 @@ type AcceptanceReport struct {
 		Warnings int  `json:"warnings"`
 		Pass     bool `json:"pass"`
 	} `json:"summary"`
-	GateMatrix []GateResult `json:"gateMatrix"`
-	Findings   []Diagnostic `json:"findings,omitempty"`
+	GateMatrix           []GateResult               `json:"gateMatrix"`
+	Findings             []Diagnostic               `json:"findings,omitempty"`
+	DictionaryCompliance DictionaryComplianceReport `json:"dictionaryCompliance,omitempty"`
+}
+
+type DictionaryComplianceReport struct {
+	MIL1553 []Dictionary1553Finding `json:"mil1553,omitempty"`
+	A429    []DictionaryA429Finding `json:"a429,omitempty"`
+}
+
+type Dictionary1553Finding struct {
+	ChannelID         uint16   `json:"channelId"`
+	RT                uint8    `json:"rt"`
+	SA                uint8    `json:"sa"`
+	WordCount         *int     `json:"wordCount,omitempty"`
+	ExpectedWordCount *int     `json:"expectedWordCount,omitempty"`
+	ModeCode          *int     `json:"modeCode,omitempty"`
+	ExpectedModeCode  *int     `json:"expectedModeCode,omitempty"`
+	Name              string   `json:"name,omitempty"`
+	Occurrences       int      `json:"occurrences"`
+	Severity          Severity `json:"severity"`
+	Issue             string   `json:"issue"`
+}
+
+type DictionaryA429Finding struct {
+	ChannelID   uint16   `json:"channelId"`
+	Label       uint8    `json:"label"`
+	SDI         uint8    `json:"sdi"`
+	Name        string   `json:"name,omitempty"`
+	Occurrences int      `json:"occurrences"`
+	Severity    Severity `json:"severity"`
+	Issue       string   `json:"issue"`
 }
 
 type Context struct {
@@ -125,6 +156,10 @@ type Context struct {
 
 	Metrics  *common.Metrics
 	AuditLog *common.PatchLog
+
+	DictionaryPath   string
+	Dictionaries     *dict.Store
+	DictionaryReport *DictionaryComplianceReport
 }
 
 func (ctx *Context) EnsureFileIndex() error {
@@ -174,6 +209,8 @@ type Engine struct {
 
 	stageBuckets map[RuleStage][]Rule
 	ruleIndex    map[string]Rule
+
+	dictionaryReport *DictionaryComplianceReport
 
 	diagnosticCallback func(Diagnostic) error
 	diagnosticErr      error
@@ -227,6 +264,16 @@ func (e *Engine) Eval(ctx *Context) ([]Diagnostic, error) {
 	if ctx == nil {
 		return nil, errors.New("nil context")
 	}
+	if ctx.DictionaryReport == nil {
+		ctx.DictionaryReport = &DictionaryComplianceReport{}
+	}
+	if ctx.Dictionaries == nil && ctx.DictionaryPath != "" {
+		store, err := dict.EnsureLoaded(ctx.DictionaryPath)
+		if err != nil {
+			return nil, err
+		}
+		ctx.Dictionaries = store
+	}
 	if err := ctx.EnsureFileIndex(); err != nil {
 		return nil, err
 	}
@@ -266,6 +313,11 @@ func (e *Engine) Eval(ctx *Context) ([]Diagnostic, error) {
 	e.diagnostics = diags
 	if e.diagnosticErr != nil {
 		return diags, e.diagnosticErr
+	}
+	if ctx != nil {
+		e.dictionaryReport = ctx.DictionaryReport
+	} else {
+		e.dictionaryReport = nil
 	}
 	return diags, nil
 }
@@ -645,6 +697,9 @@ func (e *Engine) MakeAcceptance() AcceptanceReport {
 	rep.Summary.Pass = errs == 0
 	rep.GateMatrix = e.buildGateMatrix()
 	rep.Findings = e.diagnostics
+	if e.dictionaryReport != nil {
+		rep.DictionaryCompliance = *e.dictionaryReport
+	}
 	return rep
 }
 

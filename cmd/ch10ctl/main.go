@@ -19,9 +19,11 @@ import (
 
 	"example.com/ch10gate/internal/common"
 	"example.com/ch10gate/internal/crypto"
+	"example.com/ch10gate/internal/dict"
 	"example.com/ch10gate/internal/manifest"
 	"example.com/ch10gate/internal/report"
 	"example.com/ch10gate/internal/rules"
+	"example.com/ch10gate/internal/tmats"
 )
 
 var (
@@ -66,8 +68,8 @@ func usage() {
 	fmt.Printf(`ch10ctl %s (built %s) <command> [options]
 
 Commands:
-  validate  --in <file> --profile <profile> [--rules <rulepack.json> | --rulepack-id <id> [--rulepack-version <version>]] --tmats <file> --out <diagnostics.jsonl> --acceptance <acceptance.json>
-  autofix   --in <file> --profile <profile> [--rules <rulepack.json> | --rulepack-id <id> [--rulepack-version <version>]] --tmats <file>
+  validate  --in <file> --profile <profile> [--rules <rulepack.json> | --rulepack-id <id> [--rulepack-version <version>]] [--dict <dict.json>] --tmats <file> --out <diagnostics.jsonl> --acceptance <acceptance.json>
+  autofix   --in <file> --profile <profile> [--rules <rulepack.json> | --rulepack-id <id> [--rulepack-version <version>]] [--dict <dict.json>] --tmats <file>
   report    --diagnostics <diagnostics.jsonl> --acceptance <acceptance.json>
   manifest  --inputs <comma-separated> --out <manifest.json> [--sign --key <key.pem> --cert <cert.pem> --jws-out <file>]
   verify-signature --manifest <manifest.json> --jws <signature.jws> --cert <cert.pem>
@@ -100,6 +102,7 @@ func validateCmd(args []string) {
 	concurrency := fs.Int("concurrency", runtime.NumCPU(), "maximum concurrent channel evaluations")
 	metricsFlag := fs.Bool("metrics", false, "print validation throughput metrics")
 	progressFlag := fs.Bool("progress", false, "display validation progress updates")
+	dictPath := fs.String("dict", "", "dictionary JSON file")
 	fs.Parse(args)
 
 	if *in == "" {
@@ -146,6 +149,10 @@ func validateCmd(args []string) {
 	engine.SetConcurrency(*concurrency)
 
 	ctx := &rules.Context{InputFile: *in, TMATSFile: *tmats, Profile: *profile, Metrics: metrics}
+	if err := configureDictionaries(ctx, *dictPath); err != nil {
+		fmt.Println("dictionary:", err)
+		os.Exit(1)
+	}
 	if metrics != nil {
 		metrics.Start()
 	}
@@ -203,6 +210,7 @@ func autofixCmd(args []string) {
 	includeTimestamps := fs.Bool("diag-include-timestamps", true, "include timestamp metadata in diagnostics output")
 	concurrency := fs.Int("concurrency", 1, "maximum concurrent channel evaluations")
 	auditPath := fs.String("audit", "", "audit log output (jsonl)")
+	dictPath := fs.String("dict", "", "dictionary JSON file")
 	fs.Parse(args)
 
 	if *in == "" {
@@ -246,6 +254,10 @@ func autofixCmd(args []string) {
 	engine.SetConcurrency(*concurrency)
 
 	ctx := &rules.Context{InputFile: *in, TMATSFile: *tmats, Profile: *profile}
+	if err := configureDictionaries(ctx, *dictPath); err != nil {
+		fmt.Println("dictionary:", err)
+		os.Exit(1)
+	}
 	if auditLogPath != "" {
 		ctx.AuditLog = common.NewPatchLog(auditLogPath)
 	}
@@ -272,6 +284,41 @@ func autofixCmd(args []string) {
 	if ctx.AuditLog != nil {
 		fmt.Printf("Audit log: %s\n", ctx.AuditLog.Path())
 	}
+}
+
+func configureDictionaries(ctx *rules.Context, flagValue string) error {
+	if ctx == nil {
+		return nil
+	}
+	path := strings.TrimSpace(flagValue)
+	if path != "" {
+		store, err := dict.EnsureLoaded(path)
+		if err != nil {
+			return fmt.Errorf("load dictionary %s: %w", path, err)
+		}
+		ctx.DictionaryPath = path
+		ctx.Dictionaries = store
+		return nil
+	}
+	if strings.TrimSpace(ctx.TMATSFile) == "" {
+		return nil
+	}
+	doc, err := tmats.Parse(ctx.TMATSFile)
+	if err != nil {
+		return fmt.Errorf("parse TMATS %s: %w", ctx.TMATSFile, err)
+	}
+	raw, ok := dict.PathFromTMATS(doc)
+	if !ok {
+		return nil
+	}
+	resolved := dict.ResolveTMATSPath(ctx.TMATSFile, raw)
+	store, err := dict.EnsureLoaded(resolved)
+	if err != nil {
+		return fmt.Errorf("load dictionary %s: %w", resolved, err)
+	}
+	ctx.DictionaryPath = resolved
+	ctx.Dictionaries = store
+	return nil
 }
 
 func undoCmd(args []string) {

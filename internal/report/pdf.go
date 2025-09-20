@@ -24,6 +24,7 @@ func SaveAcceptancePDF(rep rules.AcceptanceReport, out string) error {
 	addPDFTitle(pdf, "Acceptance Report")
 	addSummarySection(pdf, rep)
 	addGateMatrixSection(pdf, rep.GateMatrix)
+	addDictionarySection(pdf, rep.DictionaryCompliance)
 	addFindingsSection(pdf, rep.Findings)
 
 	if pdf.Err() {
@@ -89,6 +90,94 @@ func addGateMatrixSection(pdf *gofpdf.Fpdf, rows []rules.GateResult) {
 		renderTableRow(pdf, widths, values, lineHeight)
 	}
 	pdf.Ln(4)
+}
+
+func addDictionarySection(pdf *gofpdf.Fpdf, rep rules.DictionaryComplianceReport) {
+	pdf.SetFont("Helvetica", "B", 12)
+	pdf.Cell(0, 8, "Dictionary Compliance")
+	pdf.Ln(9)
+
+	if len(rep.MIL1553) == 0 && len(rep.A429) == 0 {
+		pdf.SetFont("Helvetica", "", 11)
+		pdf.MultiCell(0, 6, "No dictionary mismatches detected.", "", "L", false)
+		pdf.Ln(4)
+		return
+	}
+
+	if len(rep.MIL1553) > 0 {
+		pdf.SetFont("Helvetica", "B", 11)
+		pdf.Cell(0, 6, "MIL-STD-1553")
+		pdf.Ln(7)
+
+		headers := []string{"Channel", "RT/SA", "Observed", "Expected", "Name", "Severity", "Count", "Issue"}
+		widths := []float64{14, 20, 20, 20, 32, 18, 16, 40}
+
+		pdf.SetFillColor(240, 240, 240)
+		pdf.SetFont("Helvetica", "B", 10)
+		for i, h := range headers {
+			pdf.CellFormat(widths[i], 7, h, "1", 0, "L", true, 0, "")
+		}
+		pdf.Ln(-1)
+
+		pdf.SetFont("Helvetica", "", 9)
+		for _, row := range rep.MIL1553 {
+			observed := "-"
+			expected := "-"
+			if row.WordCount != nil {
+				observed = fmt.Sprintf("WC=%d", *row.WordCount)
+			} else if row.ModeCode != nil {
+				observed = fmt.Sprintf("MC=%d", *row.ModeCode)
+			}
+			if row.ExpectedWordCount != nil {
+				expected = fmt.Sprintf("WC=%d", *row.ExpectedWordCount)
+			} else if row.ExpectedModeCode != nil {
+				expected = fmt.Sprintf("MC=%d", *row.ExpectedModeCode)
+			}
+			values := []string{
+				strconv.FormatUint(uint64(row.ChannelID), 10),
+				fmt.Sprintf("%02d/%02d", row.RT, row.SA),
+				observed,
+				expected,
+				strings.TrimSpace(row.Name),
+				severityLabel(row.Severity),
+				strconv.Itoa(row.Occurrences),
+				strings.TrimSpace(row.Issue),
+			}
+			renderTableRow(pdf, widths, values, 5.0)
+		}
+		pdf.Ln(5)
+	}
+
+	if len(rep.A429) > 0 {
+		pdf.SetFont("Helvetica", "B", 11)
+		pdf.Cell(0, 6, "ARINC-429")
+		pdf.Ln(7)
+
+		headers := []string{"Channel", "Label", "SDI", "Name", "Severity", "Count", "Issue"}
+		widths := []float64{14, 20, 16, 40, 18, 16, 56}
+
+		pdf.SetFillColor(240, 240, 240)
+		pdf.SetFont("Helvetica", "B", 10)
+		for i, h := range headers {
+			pdf.CellFormat(widths[i], 7, h, "1", 0, "L", true, 0, "")
+		}
+		pdf.Ln(-1)
+
+		pdf.SetFont("Helvetica", "", 9)
+		for _, row := range rep.A429 {
+			values := []string{
+				strconv.FormatUint(uint64(row.ChannelID), 10),
+				fmt.Sprintf("0x%02X", row.Label),
+				strconv.Itoa(int(row.SDI)),
+				strings.TrimSpace(row.Name),
+				severityLabel(row.Severity),
+				strconv.Itoa(row.Occurrences),
+				strings.TrimSpace(row.Issue),
+			}
+			renderTableRow(pdf, widths, values, 5.0)
+		}
+		pdf.Ln(4)
+	}
 }
 
 func addFindingsSection(pdf *gofpdf.Fpdf, findings []rules.Diagnostic) {

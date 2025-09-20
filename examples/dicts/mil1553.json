@@ -1,0 +1,7 @@
+{
+  "a429": [],
+  "mil1553": [
+    { "rt": 3, "sa": 2, "wc": 16, "name": "Flight Control Commands" },
+    { "rt": 4, "sa": 31, "modeCode": 3, "name": "Initiate Built-In Test" }
+  ]
+}

@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"example.com/ch10gate/internal/ch10"
+	"example.com/ch10gate/internal/dict"
 	"example.com/ch10gate/internal/tmats"
 )
 
@@ -386,6 +387,84 @@ func TestWarn1553Ttb(t *testing.T) {
 	}
 	if !strings.Contains(diag.Message, "0x3") {
 		t.Fatalf("expected detail about TTB value, got %q", diag.Message)
+	}
+}
+
+func TestValidateAgainstDictionaries(t *testing.T) {
+	store, err := dict.FromJSON(dict.JSONFile{
+		A429: []dict.JSONA429Entry{
+			{Label: 0x1A, SDI: 0, Name: "Pitch Angle"},
+		},
+		MIL1553: []dict.JSONMIL1553Entry{
+			{RT: 3, SA: 2, WordCount: intPtr(16), Name: "Flight Control"},
+			{RT: 4, SA: 31, ModeCode: intPtr(3), Name: "Initiate BIT"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("dict.FromJSON: %v", err)
+	}
+
+	ctx := &Context{
+		InputFile:        "test.ch10",
+		Dictionaries:     store,
+		DictionaryReport: &DictionaryComplianceReport{},
+		Index: &ch10.FileIndex{Packets: []ch10.PacketIndex{
+			{
+				ChannelID: 1,
+				Offset:    0x100,
+				MIL1553: &ch10.MIL1553Info{
+					MessageCount: 2,
+					Messages: []ch10.MIL1553Message{
+						{HasCommandWord: true, CommandWord: uint16((3 << 11) | (2 << 5) | 18)},
+						{HasCommandWord: true, CommandWord: uint16((4 << 11) | (31 << 5) | 4)},
+					},
+				},
+			},
+			{
+				ChannelID: 2,
+				Offset:    0x200,
+				A429: &ch10.A429Info{
+					MessageCount: 1,
+					Words:        []ch10.A429Word{{Label: 0x2B, SDI: 1}},
+				},
+			},
+		}},
+	}
+
+	diag, _, err := ValidateAgainstDictionaries(ctx, Rule{RuleId: "RP-DICT", Refs: []string{"ICD"}})
+	if err != nil {
+		t.Fatalf("ValidateAgainstDictionaries err: %v", err)
+	}
+	if diag.Severity != ERROR {
+		t.Fatalf("expected severity ERROR, got %s", diag.Severity)
+	}
+	if len(ctx.DictionaryReport.MIL1553) != 2 {
+		t.Fatalf("expected 2 MIL-STD-1553 findings, got %d", len(ctx.DictionaryReport.MIL1553))
+	}
+	if len(ctx.DictionaryReport.A429) != 1 {
+		t.Fatalf("expected 1 ARINC-429 finding, got %d", len(ctx.DictionaryReport.A429))
+	}
+
+	var wordCountMismatch, modeMismatch bool
+	for _, finding := range ctx.DictionaryReport.MIL1553 {
+		if strings.Contains(finding.Issue, "Word count mismatch") {
+			wordCountMismatch = finding.ExpectedWordCount != nil
+		}
+		if strings.Contains(finding.Issue, "Mode code mismatch") {
+			modeMismatch = finding.ExpectedModeCode != nil
+		}
+	}
+	if !wordCountMismatch {
+		t.Fatalf("expected word count mismatch finding")
+	}
+	if !modeMismatch {
+		t.Fatalf("expected mode code mismatch finding")
+	}
+	if !strings.Contains(ctx.DictionaryReport.A429[0].Issue, "No dictionary entry") {
+		t.Fatalf("unexpected A429 issue: %s", ctx.DictionaryReport.A429[0].Issue)
+	}
+	if !strings.Contains(diag.Message, "Dictionary mismatches detected") {
+		t.Fatalf("unexpected diagnostic message: %s", diag.Message)
 	}
 }
 
