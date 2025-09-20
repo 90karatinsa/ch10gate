@@ -1,6 +1,7 @@
 package report
 
 import (
+	"bytes"
 	"fmt"
 	"strconv"
 	"strings"
@@ -11,26 +12,65 @@ import (
 	"example.com/ch10gate/internal/rules"
 )
 
+// PDFOptions controls how acceptance reports are rendered to PDF.
+type PDFOptions struct {
+	Lang         Language
+	ManifestHash string
+	GeneratedAt  time.Time
+}
+
 // SaveAcceptancePDF renders the given acceptance report into a PDF document.
-func SaveAcceptancePDF(rep rules.AcceptanceReport, out string) error {
+func SaveAcceptancePDF(rep rules.AcceptanceReport, out string, opts PDFOptions) error {
+	if opts.Lang == "" {
+		opts.Lang = LangEnglish
+	}
+	translator := NewTranslator(opts.Lang)
+	opts.ManifestHash = sanitizeHash(opts.ManifestHash)
+	if opts.GeneratedAt.IsZero() {
+		opts.GeneratedAt = time.Now()
+	}
+
 	pdf := gofpdf.New("P", "mm", "A4", "")
-	pdf.SetTitle("Acceptance Report", false)
+	pdf.SetTitle(translator.T("pdf.title"), false)
 	pdf.SetAuthor("ch10ctl", false)
 	pdf.SetCreator("ch10ctl", false)
 	pdf.SetMargins(15, 20, 15)
-	pdf.SetAutoPageBreak(true, 20)
+	pdf.SetAutoPageBreak(true, 25)
+	registerFooter(pdf, translator, opts)
 	pdf.AddPage()
 
-	addPDFTitle(pdf, "Acceptance Report")
-	addSummarySection(pdf, rep)
-	addGateMatrixSection(pdf, rep.GateMatrix)
-	addDictionarySection(pdf, rep.DictionaryCompliance)
-	addFindingsSection(pdf, rep.Findings)
+	addPDFTitle(pdf, translator.T("pdf.title"))
+	addSummarySection(pdf, translator, rep)
+	addManifestSection(pdf, translator, opts.ManifestHash)
+	addGateMatrixSection(pdf, translator, rep.GateMatrix)
+	addDictionarySection(pdf, translator, rep.DictionaryCompliance)
+	addFindingsSection(pdf, translator, rep.Findings)
 
 	if pdf.Err() {
 		return pdf.Error()
 	}
 	return pdf.OutputFileAndClose(out)
+}
+
+func registerFooter(pdf *gofpdf.Fpdf, tr Translator, opts PDFOptions) {
+	pdf.SetFooterFunc(func() {
+		pdf.SetY(-18)
+		pdf.SetFont("Helvetica", "", 8)
+		pdf.SetTextColor(120, 120, 120)
+
+		generated := fmt.Sprintf("%s • %s", tr.T("footer.generated_by"), opts.GeneratedAt.Format("2006-01-02 15:04"))
+		pdf.CellFormat(0, 4, generated, "", 0, "L", false, 0, "")
+
+		pageText := tr.Format("footer.page", pdf.PageNo())
+		pdf.CellFormat(0, 4, pageText, "", 0, "R", false, 0, "")
+
+		if opts.ManifestHash != "" {
+			pdf.Ln(4)
+			pdf.CellFormat(0, 4, fmt.Sprintf(tr.T("footer.hash"), formatHashForDisplay(opts.ManifestHash)), "", 0, "L", false, 0, "")
+		}
+
+		pdf.SetTextColor(0, 0, 0)
+	})
 }
 
 func addPDFTitle(pdf *gofpdf.Fpdf, title string) {
@@ -39,9 +79,9 @@ func addPDFTitle(pdf *gofpdf.Fpdf, title string) {
 	pdf.Ln(12)
 }
 
-func addSummarySection(pdf *gofpdf.Fpdf, rep rules.AcceptanceReport) {
+func addSummarySection(pdf *gofpdf.Fpdf, tr Translator, rep rules.AcceptanceReport) {
 	pdf.SetFont("Helvetica", "B", 12)
-	pdf.Cell(0, 8, "Summary")
+	pdf.Cell(0, 8, tr.T("summary.title"))
 	pdf.Ln(8)
 
 	pdf.SetFont("Helvetica", "", 11)
@@ -49,10 +89,10 @@ func addSummarySection(pdf *gofpdf.Fpdf, rep rules.AcceptanceReport) {
 		label string
 		value string
 	}{
-		{label: "Total Findings", value: strconv.Itoa(rep.Summary.Total)},
-		{label: "Errors", value: strconv.Itoa(rep.Summary.Errors)},
-		{label: "Warnings", value: strconv.Itoa(rep.Summary.Warnings)},
-		{label: "Overall", value: passLabel(rep.Summary.Pass)},
+		{label: tr.T("summary.total"), value: strconv.Itoa(rep.Summary.Total)},
+		{label: tr.T("summary.errors"), value: strconv.Itoa(rep.Summary.Errors)},
+		{label: tr.T("summary.warnings"), value: strconv.Itoa(rep.Summary.Warnings)},
+		{label: tr.T("summary.overall"), value: passLabel(tr, rep.Summary.Pass)},
 	}
 	for _, item := range items {
 		pdf.CellFormat(50, 6, item.label, "", 0, "L", false, 0, "")
@@ -61,13 +101,49 @@ func addSummarySection(pdf *gofpdf.Fpdf, rep rules.AcceptanceReport) {
 	pdf.Ln(4)
 }
 
-func addGateMatrixSection(pdf *gofpdf.Fpdf, rows []rules.GateResult) {
+func addManifestSection(pdf *gofpdf.Fpdf, tr Translator, manifestHash string) {
+	if manifestHash == "" {
+		return
+	}
+
 	pdf.SetFont("Helvetica", "B", 12)
-	pdf.Cell(0, 8, "Gate Matrix")
+	pdf.Cell(0, 8, tr.T("manifest.title"))
 	pdf.Ln(9)
 
-	headers := []string{"Stage", "Severity", "Rule", "Name", "Pass", "Findings"}
-	widths := []float64{28, 22, 36, 68, 18, 18}
+	pdf.SetFont("Helvetica", "", 10)
+	pdf.MultiCell(0, 6, fmt.Sprintf("%s: %s", tr.T("manifest.hash_label"), formatHashForDisplay(manifestHash)), "", "L", false)
+	pdf.Ln(2)
+
+	png, err := ManifestHashToQR(manifestHash, 256)
+	if err != nil {
+		pdf.SetFont("Helvetica", "", 9)
+		pdf.MultiCell(0, 5, fmt.Sprintf("%s (%v)", tr.T("manifest.qr_error"), err), "", "L", false)
+		pdf.Ln(4)
+		return
+	}
+
+	imgName := fmt.Sprintf("manifest-qr-%d", time.Now().UnixNano())
+	opt := gofpdf.ImageOptions{ImageType: "PNG"}
+	pdf.RegisterImageOptionsReader(imgName, opt, bytes.NewReader(png))
+
+	x := pdf.GetX()
+	y := pdf.GetY()
+	qrSize := 35.0
+	pdf.ImageOptions(imgName, x, y, qrSize, qrSize, false, opt, 0, "")
+	pdf.SetXY(x+qrSize+4, y)
+	pdf.SetFont("Helvetica", "", 9)
+	pdf.MultiCell(0, 5, tr.T("manifest.qr_caption"), "", "L", false)
+	pdf.SetY(y + qrSize + 2)
+	pdf.Ln(4)
+}
+
+func addGateMatrixSection(pdf *gofpdf.Fpdf, tr Translator, rows []rules.GateResult) {
+	pdf.SetFont("Helvetica", "B", 12)
+	pdf.Cell(0, 8, tr.T("gate.title"))
+	pdf.Ln(9)
+
+	headers := []string{tr.T("gate.stage"), tr.T("gate.severity"), tr.T("gate.rule"), tr.T("gate.name"), tr.T("gate.pass"), tr.T("gate.findings"), tr.T("gate.ref")}
+	widths := []float64{23, 20, 32, 54, 16, 16, 19}
 
 	pdf.SetFillColor(240, 240, 240)
 	pdf.SetFont("Helvetica", "B", 10)
@@ -80,36 +156,37 @@ func addGateMatrixSection(pdf *gofpdf.Fpdf, rows []rules.GateResult) {
 	lineHeight := 5.0
 	for _, row := range rows {
 		values := []string{
-			stageLabel(row.Stage),
+			stageLabel(tr, row.Stage),
 			severityLabel(row.Severity),
 			row.RuleId,
 			emptyFallback(row.Name, "-"),
-			passLabel(row.Pass),
+			passLabel(tr, row.Pass),
 			strconv.Itoa(row.Findings),
+			strings.Join(row.Refs, "\n"),
 		}
 		renderTableRow(pdf, widths, values, lineHeight)
 	}
 	pdf.Ln(4)
 }
 
-func addDictionarySection(pdf *gofpdf.Fpdf, rep rules.DictionaryComplianceReport) {
+func addDictionarySection(pdf *gofpdf.Fpdf, tr Translator, rep rules.DictionaryComplianceReport) {
 	pdf.SetFont("Helvetica", "B", 12)
-	pdf.Cell(0, 8, "Dictionary Compliance")
+	pdf.Cell(0, 8, tr.T("dictionary.title"))
 	pdf.Ln(9)
 
 	if len(rep.MIL1553) == 0 && len(rep.A429) == 0 {
 		pdf.SetFont("Helvetica", "", 11)
-		pdf.MultiCell(0, 6, "No dictionary mismatches detected.", "", "L", false)
+		pdf.MultiCell(0, 6, tr.T("dictionary.none"), "", "L", false)
 		pdf.Ln(4)
 		return
 	}
 
 	if len(rep.MIL1553) > 0 {
 		pdf.SetFont("Helvetica", "B", 11)
-		pdf.Cell(0, 6, "MIL-STD-1553")
+		pdf.Cell(0, 6, tr.T("dictionary.mil1553"))
 		pdf.Ln(7)
 
-		headers := []string{"Channel", "RT/SA", "Observed", "Expected", "Name", "Severity", "Count", "Issue"}
+		headers := []string{tr.T("dictionary.channel"), tr.T("dictionary.rtsa"), tr.T("dictionary.observed"), tr.T("dictionary.expected"), tr.T("dictionary.name"), tr.T("dictionary.severity"), tr.T("dictionary.count"), tr.T("dictionary.issue")}
 		widths := []float64{14, 20, 20, 20, 32, 18, 16, 40}
 
 		pdf.SetFillColor(240, 240, 240)
@@ -150,10 +227,10 @@ func addDictionarySection(pdf *gofpdf.Fpdf, rep rules.DictionaryComplianceReport
 
 	if len(rep.A429) > 0 {
 		pdf.SetFont("Helvetica", "B", 11)
-		pdf.Cell(0, 6, "ARINC-429")
+		pdf.Cell(0, 6, tr.T("dictionary.a429"))
 		pdf.Ln(7)
 
-		headers := []string{"Channel", "Label", "SDI", "Name", "Severity", "Count", "Issue"}
+		headers := []string{tr.T("dictionary.channel"), tr.T("dictionary.label"), tr.T("dictionary.sdi"), tr.T("dictionary.name"), tr.T("dictionary.severity"), tr.T("dictionary.count"), tr.T("dictionary.issue")}
 		widths := []float64{14, 20, 16, 40, 18, 16, 56}
 
 		pdf.SetFillColor(240, 240, 240)
@@ -180,14 +257,14 @@ func addDictionarySection(pdf *gofpdf.Fpdf, rep rules.DictionaryComplianceReport
 	}
 }
 
-func addFindingsSection(pdf *gofpdf.Fpdf, findings []rules.Diagnostic) {
+func addFindingsSection(pdf *gofpdf.Fpdf, tr Translator, findings []rules.Diagnostic) {
 	pdf.SetFont("Helvetica", "B", 12)
-	pdf.Cell(0, 8, "Findings")
+	pdf.Cell(0, 8, tr.T("findings.title"))
 	pdf.Ln(9)
 
 	if len(findings) == 0 {
 		pdf.SetFont("Helvetica", "", 11)
-		pdf.MultiCell(0, 6, "No findings recorded.", "", "L", false)
+		pdf.MultiCell(0, 6, tr.T("findings.none"), "", "L", false)
 		return
 	}
 
@@ -201,15 +278,14 @@ func addFindingsSection(pdf *gofpdf.Fpdf, findings []rules.Diagnostic) {
 			pdf.MultiCell(0, 5, msg, "", "L", false)
 		}
 
-		meta := findingMetadata(d)
-		if meta != "" {
+		if meta := findingMetadata(tr, d); meta != "" {
 			pdf.SetFont("Helvetica", "", 9)
 			pdf.MultiCell(0, 4, meta, "", "L", false)
 		}
 
 		if len(d.Refs) > 0 {
 			pdf.SetFont("Helvetica", "", 9)
-			pdf.MultiCell(0, 4, "Refs: "+strings.Join(d.Refs, ", "), "", "L", false)
+			pdf.MultiCell(0, 4, tr.T("findings.refs")+strings.Join(d.Refs, ", "), "", "L", false)
 		}
 
 		pdf.Ln(2)
@@ -246,30 +322,30 @@ func renderTableRow(pdf *gofpdf.Fpdf, widths []float64, values []string, lineHei
 	pdf.SetXY(xStart, yStart+rowHeight)
 }
 
-func passLabel(pass bool) string {
+func passLabel(tr Translator, pass bool) string {
 	if pass {
-		return "PASS"
+		return tr.T("pass.true")
 	}
-	return "FAIL"
+	return tr.T("pass.false")
 }
 
-func stageLabel(stage rules.RuleStage) string {
+func stageLabel(tr Translator, stage rules.RuleStage) string {
 	switch stage {
 	case rules.StageHeader:
-		return "Header"
+		return tr.T("stage.header")
 	case rules.StageTime:
-		return "Time"
+		return tr.T("stage.time")
 	case rules.StageTypeSpecific:
-		return "Type-Specific"
+		return tr.T("stage.type_specific")
 	case rules.StageTMATS:
-		return "TMATS"
+		return tr.T("stage.tmats")
 	case rules.StageStructWrite:
-		return "Struct Write"
+		return tr.T("stage.struct_write")
 	default:
 		if s := strings.TrimSpace(string(stage)); s != "" {
 			return s
 		}
-		return "-"
+		return tr.T("stage.unknown")
 	}
 }
 
@@ -287,7 +363,7 @@ func emptyFallback(val, fallback string) string {
 	return val
 }
 
-func findingMetadata(d rules.Diagnostic) string {
+func findingMetadata(tr Translator, d rules.Diagnostic) string {
 	parts := make([]string, 0, 6)
 	if !d.Ts.IsZero() {
 		parts = append(parts, d.Ts.Format(time.RFC3339))
@@ -296,22 +372,37 @@ func findingMetadata(d rules.Diagnostic) string {
 		parts = append(parts, d.File)
 	}
 	if d.ChannelId != 0 {
-		parts = append(parts, fmt.Sprintf("Channel %d", d.ChannelId))
+		parts = append(parts, tr.Format("metadata.channel", d.ChannelId))
 	}
 	if d.PacketIndex != 0 {
-		parts = append(parts, fmt.Sprintf("Packet %d", d.PacketIndex))
+		parts = append(parts, tr.Format("metadata.packet", d.PacketIndex))
 	}
 	if d.Offset != "" {
-		parts = append(parts, "Offset "+d.Offset)
+		parts = append(parts, tr.Format("metadata.offset", d.Offset))
 	}
 	if d.TimestampUs != nil {
-		parts = append(parts, fmt.Sprintf("Timestamp %dµs", *d.TimestampUs))
+		parts = append(parts, tr.Format("metadata.timestamp", *d.TimestampUs))
 	}
 	if d.TimestampSource != nil && *d.TimestampSource != "" {
-		parts = append(parts, "Source "+*d.TimestampSource)
+		parts = append(parts, tr.Format("metadata.source", *d.TimestampSource))
 	}
 	if len(parts) == 0 {
 		return ""
 	}
 	return strings.Join(parts, " · ")
+}
+
+func formatHashForDisplay(hash string) string {
+	cleaned := sanitizeHash(hash)
+	if cleaned == "" {
+		return ""
+	}
+	var b strings.Builder
+	for i, r := range cleaned {
+		if i > 0 && i%4 == 0 {
+			b.WriteRune(' ')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }

@@ -70,7 +70,7 @@ func usage() {
 Commands:
   validate  --in <file> --profile <profile> [--rules <rulepack.json> | --rulepack-id <id> [--rulepack-version <version>]] [--dict <dict.json>] --tmats <file> --out <diagnostics.jsonl> --acceptance <acceptance.json>
   autofix   --in <file> --profile <profile> [--rules <rulepack.json> | --rulepack-id <id> [--rulepack-version <version>]] [--dict <dict.json>] --tmats <file>
-  report    --diagnostics <diagnostics.jsonl> --acceptance <acceptance.json>
+  report    --diagnostics <diagnostics.jsonl> --acceptance <acceptance.json> [--pdf <report.pdf> --lang <en|tr> --manifest <manifest.json>]
   manifest  --inputs <comma-separated> --out <manifest.json> [--sign --key <key.pem> --cert <cert.pem> --jws-out <file>]
   verify-signature --manifest <manifest.json> --jws <signature.jws> --cert <cert.pem>
   batch     --in <dir> --profile <profile> --rules <rulepack.json> --out-dir <dir>
@@ -452,10 +452,17 @@ func reportCmd(args []string) {
 	diagPath := fs.String("diagnostics", "", "diagnostics.jsonl")
 	accPath := fs.String("acceptance", "", "acceptance_report.json")
 	pdfPath := fs.String("pdf", "", "output acceptance report PDF")
+	langFlag := fs.String("lang", "en", "PDF language (en or tr)")
+	manifestPath := fs.String("manifest", "", "manifest JSON used to derive QR hash")
 	fs.Parse(args)
 	if *pdfPath != "" {
 		if *accPath == "" {
 			fmt.Println("--pdf requires --acceptance")
+			os.Exit(1)
+		}
+		lang, err := report.ParseLanguage(*langFlag)
+		if err != nil {
+			fmt.Println("lang:", err)
 			os.Exit(1)
 		}
 		rep, err := report.LoadAcceptanceJSON(*accPath)
@@ -463,7 +470,16 @@ func reportCmd(args []string) {
 			fmt.Println("load acceptance:", err)
 			os.Exit(1)
 		}
-		if err := report.SaveAcceptancePDF(rep, *pdfPath); err != nil {
+		opts := report.PDFOptions{Lang: lang}
+		if *manifestPath != "" {
+			hash, err := manifestShortHash(*manifestPath)
+			if err != nil {
+				fmt.Println("manifest hash:", err)
+				os.Exit(1)
+			}
+			opts.ManifestHash = hash
+		}
+		if err := report.SaveAcceptancePDF(rep, *pdfPath, opts); err != nil {
 			fmt.Println("write pdf:", err)
 			os.Exit(1)
 		}
@@ -471,6 +487,17 @@ func reportCmd(args []string) {
 	}
 	fmt.Println("Diagnostics:", *diagPath)
 	fmt.Println("Acceptance:", *accPath)
+}
+
+func manifestShortHash(path string) (string, error) {
+	sum, _, err := common.Sha256OfFile(path)
+	if err != nil {
+		return "", err
+	}
+	if len(sum) < 32 {
+		return "", fmt.Errorf("manifest hash too short: %d", len(sum))
+	}
+	return strings.ToUpper(sum[:32]), nil
 }
 
 func manifestCmd(args []string) {

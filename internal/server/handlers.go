@@ -239,7 +239,7 @@ func (s *Server) handleValidate(w http.ResponseWriter, r *http.Request) {
 			_ = writer.WriteObject(map[string]any{"type": "error", "error": err.Error()})
 			return
 		}
-		if err := report.SaveAcceptancePDF(rep, pdfPath); err != nil {
+		if err := report.SaveAcceptancePDF(rep, pdfPath, report.PDFOptions{}); err != nil {
 			_ = writer.WriteObject(map[string]any{"type": "error", "error": err.Error()})
 			return
 		}
@@ -306,7 +306,7 @@ func (s *Server) handleValidate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("acceptance pdf temp: %v", err), http.StatusInternalServerError)
 		return
 	}
-	if err := report.SaveAcceptancePDF(rep, pdfPath); err != nil {
+	if err := report.SaveAcceptancePDF(rep, pdfPath, report.PDFOptions{}); err != nil {
 		http.Error(w, fmt.Sprintf("write acceptance: %v", err), http.StatusInternalServerError)
 		return
 	}
