@@ -35,13 +35,14 @@ func TestParseSecHdrFlags(t *testing.T) {
 
 func TestDecodeIPTSToMicros(t *testing.T) {
 	tests := []struct {
-		name     string
-		tf       uint8
-		raw      []byte
-		wantUs   int64
-		wantErr  error
-		wantSecs uint32
-		wantSub  uint32
+		name       string
+		tf         uint8
+		raw        []byte
+		wantUs     int64
+		wantErr    error
+		wantErrMsg string
+		wantSecs   uint32
+		wantSub    uint32
 	}{
 		{
 			name:     "ch4 binary",
@@ -66,14 +67,25 @@ func TestDecodeIPTSToMicros(t *testing.T) {
 			wantUs:  -1,
 			wantErr: ErrUnsupportedTimeFormat,
 		},
+		{
+			name:       "short buffer",
+			tf:         timeFormatIRIG106,
+			raw:        []byte{0x00, 0x01, 0x02},
+			wantUs:     -1,
+			wantErrMsg: "timestamp too short: 3 bytes",
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			got, secondary, err := decodeIPTSToMicros(tc.tf, tc.raw)
-			if tc.wantErr != nil {
-				if !errors.Is(err, tc.wantErr) {
-					t.Fatalf("expected error %v, got %v", tc.wantErr, err)
+			if tc.wantErr != nil || tc.wantErrMsg != "" {
+				if tc.wantErr != nil {
+					if !errors.Is(err, tc.wantErr) {
+						t.Fatalf("expected error %v, got %v", tc.wantErr, err)
+					}
+				} else if err == nil || err.Error() != tc.wantErrMsg {
+					t.Fatalf("expected error %q, got %v", tc.wantErrMsg, err)
 				}
 				if got != -1 {
 					t.Fatalf("expected -1 timestamp on error, got %d", got)
