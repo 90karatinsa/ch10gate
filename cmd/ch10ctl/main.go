@@ -143,7 +143,24 @@ func reportCmd(args []string) {
 	fs := flag.NewFlagSet("report", flag.ExitOnError)
 	diagPath := fs.String("diagnostics", "", "diagnostics.jsonl")
 	accPath := fs.String("acceptance", "", "acceptance_report.json")
+	pdfPath := fs.String("pdf", "", "output acceptance report PDF")
 	fs.Parse(args)
+	if *pdfPath != "" {
+		if *accPath == "" {
+			fmt.Println("--pdf requires --acceptance")
+			os.Exit(1)
+		}
+		rep, err := report.LoadAcceptanceJSON(*accPath)
+		if err != nil {
+			fmt.Println("load acceptance:", err)
+			os.Exit(1)
+		}
+		if err := report.SaveAcceptancePDF(rep, *pdfPath); err != nil {
+			fmt.Println("write pdf:", err)
+			os.Exit(1)
+		}
+		fmt.Println("Wrote PDF:", *pdfPath)
+	}
 	fmt.Println("Diagnostics:", *diagPath)
 	fmt.Println("Acceptance:", *accPath)
 }
