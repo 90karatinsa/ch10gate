@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/bits"
 	"os"
 
 	"example.com/ch10gate/internal/common"
@@ -297,6 +298,16 @@ func (r *Reader) Next() (PacketHeader, PacketIndex, error) {
 				}
 				idx.MIL1553 = info
 			}
+		} else if hdr.DataType == 0x38 {
+			info, err := parseA429Payload(r.file, payloadOffset, payloadLen)
+			if err != nil {
+				common.Logf("ARINC-429 parse error at offset %d: %v", r.offset, err)
+			} else if info != nil {
+				if info.ParseError != "" {
+					common.Logf("ARINC-429 parse warning at offset %d: %s", r.offset, info.ParseError)
+				}
+				idx.A429 = info
+			}
 		}
 
 		if isTime {
@@ -543,6 +554,82 @@ func parseMIL1553Payload(r io.ReaderAt, offset int64, payloadLen int64, dataType
 
 	if info.ParseError == "" && info.MessageCount != uint32(len(info.Messages)) {
 		info.ParseError = fmt.Sprintf("message count mismatch: expected %d, parsed %d", info.MessageCount, len(info.Messages))
+	}
+	return info, nil
+}
+
+func parseA429Payload(r io.ReaderAt, offset int64, payloadLen int64) (*A429Info, error) {
+	info := &A429Info{}
+	if payloadLen <= 0 {
+		info.ParseError = "payload empty"
+		return info, nil
+	}
+	if payloadLen < 4 {
+		info.ParseError = "payload shorter than CSDW"
+		return info, nil
+	}
+
+	var csdwBuf [4]byte
+	n, err := r.ReadAt(csdwBuf[:], offset)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return info, err
+	}
+	if n < 4 {
+		info.ParseError = "payload shorter than CSDW"
+		return info, nil
+	}
+	info.CSDW = binary.BigEndian.Uint32(csdwBuf[:])
+	info.MessageCount = uint32(info.CSDW & 0x0000FFFF)
+	cursor := offset + 4
+	end := offset + payloadLen
+
+	if info.MessageCount == 0 {
+		return info, nil
+	}
+	expectedLen := int64(info.MessageCount) * 8
+	if cursor+expectedLen > end {
+		info.ParseError = "payload shorter than ID/data words"
+		return info, nil
+	}
+
+	info.Words = make([]A429Word, 0, info.MessageCount)
+	var pairBuf [8]byte
+	for wordIdx := uint32(0); wordIdx < info.MessageCount; wordIdx++ {
+		if cursor+8 > end {
+			info.ParseError = fmt.Sprintf("word %d truncated", wordIdx+1)
+			return info, nil
+		}
+		n, err = r.ReadAt(pairBuf[:], cursor)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return info, err
+		}
+		if n < 8 {
+			info.ParseError = fmt.Sprintf("word %d truncated", wordIdx+1)
+			return info, nil
+		}
+		idWord := binary.BigEndian.Uint32(pairBuf[0:4])
+		dataWord := binary.BigEndian.Uint32(pairBuf[4:8])
+		cursor += 8
+
+		word := A429Word{
+			IDWord:          idWord,
+			DataWord:        dataWord,
+			Bus:             uint8((idWord >> 24) & 0xFF),
+			FormatError:     idWord&(1<<23) != 0,
+			ParityErrorFlag: idWord&(1<<22) != 0,
+			BusSpeedHigh:    idWord&(1<<21) != 0,
+			GapTime0p1Us:    idWord & 0x000FFFFF,
+			Label:           uint8(dataWord & 0xFF),
+			SDI:             uint8((dataWord >> 8) & 0x3),
+			SSM:             uint8((dataWord >> 29) & 0x3),
+			ParityBit:       uint8((dataWord >> 31) & 0x1),
+		}
+		word.ComputedParity = bits.OnesCount32(dataWord)%2 == 1
+		info.Words = append(info.Words, word)
+	}
+
+	if uint32(len(info.Words)) != info.MessageCount {
+		info.ParseError = fmt.Sprintf("message count mismatch: expected %d, parsed %d", info.MessageCount, len(info.Words))
 	}
 	return info, nil
 }

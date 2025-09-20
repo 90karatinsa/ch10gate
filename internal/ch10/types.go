@@ -44,6 +44,7 @@ type PacketIndex struct {
 	Source       TimestampSource
 	IsTimePacket bool
 	MIL1553      *MIL1553Info
+	A429         *A429Info
 }
 
 type FileIndex struct {
@@ -67,5 +68,27 @@ type MIL1553Info struct {
 	TTB          uint8
 	MessageCount uint32
 	Messages     []MIL1553Message
+	ParseError   string
+}
+
+type A429Word struct {
+	IDWord          uint32
+	DataWord        uint32
+	Bus             uint8
+	FormatError     bool
+	ParityErrorFlag bool
+	BusSpeedHigh    bool
+	GapTime0p1Us    uint32
+	Label           uint8
+	SDI             uint8
+	SSM             uint8
+	ParityBit       uint8
+	ComputedParity  bool
+}
+
+type A429Info struct {
+	CSDW         uint32
+	MessageCount uint32
+	Words        []A429Word
 	ParseError   string
 }

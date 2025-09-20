@@ -733,11 +733,176 @@ func Warn1553Ttb(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 }
 
 func FixA429Gap(ctx *Context, rule Rule) (Diagnostic, bool, error) {
-	return Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: WARN, Message: "ARINC-429 gap fix not implemented", Refs: rule.Refs}, false, ErrNotImplemented
+	diag := Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: INFO, Message: "ARINC-429 gap inspection", Refs: rule.Refs}
+	if ctx == nil || ctx.InputFile == "" {
+		diag.Severity = ERROR
+		diag.Message = "no input file provided"
+		return diag, false, errors.New("no input file")
+	}
+	if ctx.Profile == "" {
+		diag.Severity = ERROR
+		diag.Message = "profile required"
+		return diag, false, errors.New("profile required")
+	}
+	if err := ctx.EnsureFileIndex(); err != nil {
+		diag.Severity = ERROR
+		diag.Message = "cannot index file"
+		return diag, false, err
+	}
+	if ctx.Index == nil || len(ctx.Index.Packets) == 0 {
+		diag.Message = "no packets to inspect"
+		return diag, false, nil
+	}
+
+	const gapLimit = 1_000_000
+	splits := make(map[int][]int)
+	var (
+		firstPktIdx  = -1
+		firstWordIdx = -1
+		firstPacket  ch10.PacketIndex
+		violations   int
+	)
+
+	for i := range ctx.Index.Packets {
+		pkt := &ctx.Index.Packets[i]
+		if pkt.DataType != 0x38 {
+			continue
+		}
+		info := pkt.A429
+		if info == nil {
+			diag.Severity = ERROR
+			diag.Message = "ARINC-429 metadata unavailable"
+			diag.PacketIndex = i
+			diag.ChannelId = int(pkt.ChannelID)
+			diag.Offset = fmt.Sprintf("0x%X", pkt.Offset)
+			return diag, false, errors.New("a429 metadata missing")
+		}
+		if info.ParseError != "" {
+			diag.Severity = ERROR
+			diag.Message = fmt.Sprintf("cannot inspect ARINC-429 packet (%s)", info.ParseError)
+			diag.PacketIndex = i
+			diag.ChannelId = int(pkt.ChannelID)
+			diag.Offset = fmt.Sprintf("0x%X", pkt.Offset)
+			return diag, false, nil
+		}
+		for w := 1; w < len(info.Words); w++ {
+			if info.Words[w].GapTime0p1Us > gapLimit {
+				splits[i] = append(splits[i], w)
+				violations++
+				if firstPktIdx < 0 {
+					firstPktIdx = i
+					firstWordIdx = w
+					firstPacket = *pkt
+				}
+			}
+		}
+	}
+
+	if len(splits) == 0 {
+		diag.Message = "ARINC-429 gaps verified"
+		return diag, false, nil
+	}
+
+	outPath, err := ch10.RewriteA429WithSplits(ctx.InputFile, ctx.Profile, ctx.Index, splits)
+	if err != nil {
+		diag.Severity = ERROR
+		diag.Message = "failed to rewrite ARINC-429 packets"
+		return diag, false, err
+	}
+
+	diag.PacketIndex = firstPktIdx
+	diag.ChannelId = int(firstPacket.ChannelID)
+	diag.Offset = fmt.Sprintf("0x%X", firstPacket.Offset)
+	if firstPacket.TimeStampUs >= 0 {
+		offsetUs := computeA429WordOffset(firstPacket.A429, firstWordIdx)
+		diag.TimestampUs = int64Ptr(firstPacket.TimeStampUs + offsetUs)
+		src := string(firstPacket.Source)
+		diag.TimestampSource = stringPtr(src)
+	}
+	if firstWordIdx >= 0 && firstPacket.A429 != nil && firstWordIdx < len(firstPacket.A429.Words) {
+		gapMs := float64(firstPacket.A429.Words[firstWordIdx].GapTime0p1Us) / 10000.0
+		diag.Message = fmt.Sprintf("fixed %d ARINC-429 gap violation(s), worst gap %.3f ms, wrote %s", violations, gapMs, filepath.Base(outPath))
+	} else {
+		diag.Message = fmt.Sprintf("fixed %d ARINC-429 gap violation(s), wrote %s", violations, filepath.Base(outPath))
+	}
+	diag.FixSuggested = true
+	diag.FixApplied = true
+	diag.FixPatchId = filepath.Base(outPath)
+	return diag, true, nil
 }
 
 func WarnA429Parity(ctx *Context, rule Rule) (Diagnostic, bool, error) {
-	return Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: INFO, Message: "ARINC-429 parity flagged (placeholder)", Refs: rule.Refs}, false, nil
+	diag := Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: INFO, Message: "ARINC-429 parity verified", Refs: rule.Refs}
+	if ctx == nil || ctx.InputFile == "" {
+		diag.Severity = ERROR
+		diag.Message = "no input file provided"
+		return diag, false, errors.New("no input file")
+	}
+	if err := ctx.EnsureFileIndex(); err != nil {
+		diag.Severity = ERROR
+		diag.Message = "cannot index file"
+		return diag, false, err
+	}
+	if ctx.Index == nil || len(ctx.Index.Packets) == 0 {
+		diag.Message = "no packets to inspect"
+		return diag, false, nil
+	}
+
+	for i := range ctx.Index.Packets {
+		pkt := &ctx.Index.Packets[i]
+		if pkt.DataType != 0x38 {
+			continue
+		}
+		info := pkt.A429
+		if info == nil {
+			continue
+		}
+		if info.ParseError != "" {
+			diag.Severity = WARN
+			diag.Message = fmt.Sprintf("ARINC-429 parity not inspected (%s)", info.ParseError)
+			diag.PacketIndex = i
+			diag.ChannelId = int(pkt.ChannelID)
+			diag.Offset = fmt.Sprintf("0x%X", pkt.Offset)
+			return diag, false, nil
+		}
+		for w, word := range info.Words {
+			parityMismatch := !word.ComputedParity
+			if !word.ParityErrorFlag && !parityMismatch {
+				continue
+			}
+			diag.Severity = WARN
+			diag.PacketIndex = i
+			diag.ChannelId = int(pkt.ChannelID)
+			diag.Offset = fmt.Sprintf("0x%X", pkt.Offset)
+			if pkt.TimeStampUs >= 0 {
+				offsetUs := computeA429WordOffset(info, w)
+				diag.TimestampUs = int64Ptr(pkt.TimeStampUs + offsetUs)
+				src := string(pkt.Source)
+				diag.TimestampSource = stringPtr(src)
+			}
+			reason := "parity flag"
+			if parityMismatch && word.ParityErrorFlag {
+				reason = "parity flag + recompute"
+			} else if parityMismatch {
+				reason = "parity recompute"
+			}
+			diag.Message = fmt.Sprintf("%s (label 0x%02X SDI=%d word=%d %s)", rule.Message, word.Label, word.SDI, w+1, reason)
+			return diag, false, nil
+		}
+	}
+
+	return diag, false, nil
+}
+
+func computeA429WordOffset(info *ch10.A429Info, idx int) int64 {
+	if info == nil || idx <= 0 || idx >= len(info.Words) {
+		return 0
+	}
+	var total uint64
+	for i := 1; i <= idx && i < len(info.Words); i++ {
+		total += uint64(info.Words[i].GapTime0p1Us)
+	}
+	return int64(total / 10)
 }
 
 func AddEthIPH(ctx *Context, rule Rule) (Diagnostic, bool, error) {
