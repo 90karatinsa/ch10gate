@@ -2,6 +2,7 @@ package rules
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"example.com/ch10gate/internal/ch10"
+	"example.com/ch10gate/internal/common"
 	"example.com/ch10gate/internal/eth"
 	"example.com/ch10gate/internal/tmats"
 )
@@ -49,6 +51,57 @@ func nextUnusedChannelID(used map[uint16]bool) uint16 {
 			id = 1
 		}
 	}
+}
+
+func formatOffsetRange(offset int64, length int) string {
+	if length <= 0 {
+		return ""
+	}
+	if length == 1 {
+		return fmt.Sprintf("0x%X", offset)
+	}
+	end := offset + int64(length) - 1
+	return fmt.Sprintf("0x%X-0x%X", offset, end)
+}
+
+func appendAuditEntries(ctx *Context, rule Rule, edits []ch10.PatchEdit) error {
+	if ctx == nil || ctx.AuditLog == nil || ctx.InputFile == "" {
+		return nil
+	}
+	if len(edits) == 0 {
+		return nil
+	}
+	f, err := os.Open(ctx.InputFile)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	ref := ""
+	if len(rule.Refs) > 0 {
+		ref = rule.Refs[0]
+	}
+	for _, edit := range edits {
+		if len(edit.Data) == 0 {
+			continue
+		}
+		before := make([]byte, len(edit.Data))
+		if _, err := f.ReadAt(before, edit.Offset); err != nil {
+			return err
+		}
+		entry := common.PatchEntry{
+			RuleID:    rule.RuleId,
+			Ref:       ref,
+			Offset:    edit.Offset,
+			Range:     formatOffsetRange(edit.Offset, len(edit.Data)),
+			BeforeHex: strings.ToUpper(hex.EncodeToString(before)),
+			AfterHex:  strings.ToUpper(hex.EncodeToString(edit.Data)),
+			Ts:        time.Now().UTC(),
+		}
+		if err := ctx.AuditLog.Append(entry); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (e *Engine) RegisterBuiltins() {
@@ -161,6 +214,11 @@ func FixHeaderChecksum(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 	if mismatched == 0 {
 		diag.Message = "header checksums verified"
 		return diag, false, nil
+	}
+	if err := appendAuditEntries(ctx, rule, edits); err != nil {
+		diag.Severity = ERROR
+		diag.Message = fmt.Sprintf("failed to record audit trail: %v", err)
+		return diag, false, err
 	}
 	if err := ch10.ApplyPatch(ctx.InputFile, edits); err != nil {
 		diag.Severity = ERROR
@@ -288,6 +346,11 @@ func FixDataChecksumOrTrailer(ctx *Context, rule Rule) (Diagnostic, bool, error)
 	if mismatched == 0 {
 		diag.Message = "data checksums verified"
 		return diag, false, nil
+	}
+	if err := appendAuditEntries(ctx, rule, edits); err != nil {
+		diag.Severity = ERROR
+		diag.Message = fmt.Sprintf("failed to record audit trail: %v", err)
+		return diag, false, err
 	}
 	if err := ch10.ApplyPatch(ctx.InputFile, edits); err != nil {
 		diag.Severity = ERROR
@@ -485,6 +548,11 @@ func FixLengths(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 	if len(edits) == 0 {
 		diag.Message = "packet/data lengths verified"
 		return diag, false, nil
+	}
+	if err := appendAuditEntries(ctx, rule, edits); err != nil {
+		diag.Severity = ERROR
+		diag.Message = fmt.Sprintf("failed to record audit trail: %v", err)
+		return diag, false, err
 	}
 	if err := ch10.ApplyPatch(ctx.InputFile, edits); err != nil {
 		diag.Severity = ERROR
@@ -1175,6 +1243,12 @@ func FixPCMAlign(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 		return diag, false, nil
 	}
 
+	if err := appendAuditEntries(ctx, rule, edits); err != nil {
+		diag.Severity = ERROR
+		diag.Message = fmt.Sprintf("failed to record audit trail: %v", err)
+		return diag, false, err
+	}
+
 	if err := ch10.ApplyPatch(ctx.InputFile, edits); err != nil {
 		diag.Severity = ERROR
 		diag.Message = "failed to apply PCM alignment fixes"
@@ -1798,6 +1872,12 @@ func FixA664Lens(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 	if messagesFix == 0 {
 		diag.Message = "A664 lengths already consistent"
 		return diag, false, nil
+	}
+
+	if err := appendAuditEntries(ctx, rule, edits); err != nil {
+		diag.Severity = ERROR
+		diag.Message = fmt.Sprintf("failed to record audit trail: %v", err)
+		return diag, false, err
 	}
 
 	if err := ch10.ApplyPatch(ctx.InputFile, edits); err != nil {

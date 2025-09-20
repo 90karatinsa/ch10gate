@@ -123,7 +123,8 @@ type Context struct {
 	PrimaryHeader *ch10.PacketHeader
 	Index         *ch10.FileIndex
 
-	Metrics *common.Metrics
+	Metrics  *common.Metrics
+	AuditLog *common.PatchLog
 }
 
 func (ctx *Context) EnsureFileIndex() error {
