@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -31,13 +32,26 @@ type logConfig struct {
 }
 
 type config struct {
-	Port            int       `yaml:"port"`
-	StorageDir      string    `yaml:"storageDir"`
-	Concurrency     int       `yaml:"concurrency"`
-	DefaultProfile  string    `yaml:"defaultProfile"`
-	DefaultRulePack string    `yaml:"defaultRulePack"`
-	Lang            string    `yaml:"lang"`
-	Logs            logConfig `yaml:"logs"`
+	Port            int                   `yaml:"port"`
+	StorageDir      string                `yaml:"storageDir"`
+	Concurrency     int                   `yaml:"concurrency"`
+	ProfileManifest string                `yaml:"profileManifest"`
+	ManifestSigning manifestSigningConfig `yaml:"manifestSigning"`
+	Profiles        []profileConfig       `yaml:"profiles"`
+	Lang            string                `yaml:"lang"`
+	Logs            logConfig             `yaml:"logs"`
+}
+
+type manifestSigningConfig struct {
+	PrivateKey  string `yaml:"privateKey"`
+	Certificate string `yaml:"certificate"`
+}
+
+type profileConfig struct {
+	ID        string `yaml:"id"`
+	Name      string `yaml:"name"`
+	Rules     string `yaml:"rules"`
+	Signature string `yaml:"signature"`
 }
 
 func loadConfig(path string) (config, error) {
@@ -51,6 +65,21 @@ func loadConfig(path string) (config, error) {
 	if err := dec.Decode(&cfg); err != nil {
 		return cfg, err
 	}
+	baseDir := filepath.Dir(path)
+	resolvePath := func(p string) string {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			return ""
+		}
+		if filepath.IsAbs(p) {
+			return filepath.Clean(p)
+		}
+		candidate := filepath.Clean(filepath.Join(baseDir, p))
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+		return filepath.Clean(p)
+	}
 	if cfg.Port == 0 {
 		cfg.Port = 8080
 	}
@@ -60,8 +89,36 @@ func loadConfig(path string) (config, error) {
 	if cfg.Concurrency <= 0 {
 		cfg.Concurrency = runtime.NumCPU()
 	}
-	if cfg.DefaultProfile == "" || cfg.DefaultRulePack == "" {
-		return cfg, errors.New("default profile and rule pack must be configured")
+	cfg.ProfileManifest = resolvePath(cfg.ProfileManifest)
+	if cfg.ProfileManifest == "" {
+		cfg.ProfileManifest = resolvePath(filepath.Join("..", "profiles", "index.json"))
+	}
+	cfg.ManifestSigning.PrivateKey = resolvePath(cfg.ManifestSigning.PrivateKey)
+	cfg.ManifestSigning.Certificate = resolvePath(cfg.ManifestSigning.Certificate)
+	if len(cfg.Profiles) == 0 {
+		if cfg.ProfileManifest == "" {
+			return cfg, errors.New("no profile manifest configured")
+		}
+		packs, err := server.LoadProfileManifest(cfg.ProfileManifest)
+		if err != nil {
+			return cfg, err
+		}
+		for _, pack := range packs {
+			cfg.Profiles = append(cfg.Profiles, profileConfig{
+				ID:        pack.ID,
+				Name:      pack.Name,
+				Rules:     pack.Rules,
+				Signature: pack.Signature,
+			})
+		}
+	} else {
+		for i := range cfg.Profiles {
+			cfg.Profiles[i].Rules = resolvePath(cfg.Profiles[i].Rules)
+			cfg.Profiles[i].Signature = resolvePath(cfg.Profiles[i].Signature)
+		}
+	}
+	if len(cfg.Profiles) == 0 {
+		return cfg, errors.New("no profiles configured")
 	}
 	if cfg.Lang == "" {
 		cfg.Lang = "en_US.UTF-8"
@@ -132,10 +189,22 @@ func main() {
 			log.Fatalf("update init: %v", err)
 		}
 	}
+	packs := make([]server.ProfilePack, len(cfg.Profiles))
+	for i, pack := range cfg.Profiles {
+		packs[i] = server.ProfilePack{
+			ID:        pack.ID,
+			Name:      pack.Name,
+			Rules:     pack.Rules,
+			Signature: pack.Signature,
+		}
+	}
 	srv, err := server.NewServer(server.Options{
-		StorageDir: cfg.StorageDir,
-		ProfilePacks: map[string]string{
-			cfg.DefaultProfile: cfg.DefaultRulePack,
+		StorageDir:      cfg.StorageDir,
+		ProfileManifest: cfg.ProfileManifest,
+		ProfilePacks:    packs,
+		ManifestSigning: server.ManifestSigningOptions{
+			PrivateKeyPath:  cfg.ManifestSigning.PrivateKey,
+			CertificatePath: cfg.ManifestSigning.Certificate,
 		},
 		Concurrency:     cfg.Concurrency,
 		EnableAdmin:     *enableAdmin,

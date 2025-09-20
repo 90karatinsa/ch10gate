@@ -1,8 +1,31 @@
 port: 8080
 storageDir: ./data
 concurrency: 4
-defaultProfile: "106-15"
-defaultRulePack: "profiles/106-15/rules-min.json"
+profileManifest: ../profiles/index.json
+manifestSigning:
+  privateKey: ./dev-manifest-key.pem
+  certificate: ./dev-manifest-cert.pem
+profiles:
+  - id: "106-09"
+    name: "IRIG 106-09"
+    rules: ../profiles/106-09/rules.json
+    signature: ../profiles/106-09/rules.json.sha256
+  - id: "106-11"
+    name: "IRIG 106-11"
+    rules: ../profiles/106-11/rules.json
+    signature: ../profiles/106-11/rules.json.sha256
+  - id: "106-13"
+    name: "IRIG 106-13"
+    rules: ../profiles/106-13/rules.json
+    signature: ../profiles/106-13/rules.json.sha256
+  - id: "106-15"
+    name: "IRIG 106-15"
+    rules: ../profiles/106-15/rules.json
+    signature: ../profiles/106-15/rules.json.sha256
+  - id: "106-20"
+    name: "IRIG 106-20"
+    rules: ../profiles/106-20/rules.json
+    signature: ../profiles/106-20/rules.json.sha256
 lang: "en_US.UTF-8"
 logs:
   directory: ./logs

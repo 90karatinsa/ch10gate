@@ -114,14 +114,20 @@ paths:
                   type: string
                   enum: ["sha256", "sha512"]
                   default: "sha256"
-                sign: {type: boolean}
+                sign:
+                  type: boolean
+                  description: Request a detached JWS signature if the server is configured for manifest signing
       responses:
         "200":
-          description: Manifest JSON with artifact reference
+          description: Manifest JSON with artifact references
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ManifestResponse"
+        "400":
+          description: Invalid inputs or unsupported hash algorithm
+        "503":
+          description: Manifest signing requested but not configured on the server
   /profiles:
     get:
       summary: List supported profiles
@@ -260,8 +266,13 @@ components:
       properties:
         manifest:
           $ref: "#/components/schemas/Manifest"
+        manifestArtifact:
+          $ref: "#/components/schemas/ArtifactRef"
+        signatureArtifact:
+          $ref: "#/components/schemas/ArtifactRef"
         artifact:
           $ref: "#/components/schemas/ArtifactRef"
+          deprecated: true
     UploadResponse:
       type: object
       properties:

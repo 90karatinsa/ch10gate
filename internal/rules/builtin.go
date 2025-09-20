@@ -41,6 +41,10 @@ func intPtr(v int) *int { return &v }
 
 func stringPtr(s string) *string { return &s }
 
+func isDryRun(ctx *Context) bool {
+	return ctx != nil && ctx.DryRun
+}
+
 func nextUnusedChannelID(used map[uint16]bool) uint16 {
 	var id uint16 = 1
 	for {
@@ -68,6 +72,9 @@ func formatOffsetRange(offset int64, length int) string {
 
 func appendAuditEntries(ctx *Context, rule Rule, edits []ch10.PatchEdit) error {
 	if ctx == nil || ctx.AuditLog == nil || ctx.InputFile == "" {
+		return nil
+	}
+	if ctx.DryRun {
 		return nil
 	}
 	if len(edits) == 0 {
@@ -218,6 +225,11 @@ func FixHeaderChecksum(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 		diag.Message = "header checksums verified"
 		return diag, false, nil
 	}
+	if isDryRun(ctx) {
+		diag.Message = fmt.Sprintf("would fix header checksum on %d packets", mismatched)
+		diag.FixSuggested = true
+		return diag, false, nil
+	}
 	if err := appendAuditEntries(ctx, rule, edits); err != nil {
 		diag.Severity = ERROR
 		diag.Message = fmt.Sprintf("failed to record audit trail: %v", err)
@@ -348,6 +360,11 @@ func FixDataChecksumOrTrailer(ctx *Context, rule Rule) (Diagnostic, bool, error)
 
 	if mismatched == 0 {
 		diag.Message = "data checksums verified"
+		return diag, false, nil
+	}
+	if isDryRun(ctx) {
+		diag.Message = fmt.Sprintf("would fix data checksum on %d packets", mismatched)
+		diag.FixSuggested = true
 		return diag, false, nil
 	}
 	if err := appendAuditEntries(ctx, rule, edits); err != nil {
@@ -552,6 +569,11 @@ func FixLengths(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 		diag.Message = "packet/data lengths verified"
 		return diag, false, nil
 	}
+	if isDryRun(ctx) {
+		diag.Message = fmt.Sprintf("would update length fields in %d packets", fixed)
+		diag.FixSuggested = true
+		return diag, false, nil
+	}
 	if err := appendAuditEntries(ctx, rule, edits); err != nil {
 		diag.Severity = ERROR
 		diag.Message = fmt.Sprintf("failed to record audit trail: %v", err)
@@ -616,19 +638,12 @@ func RemapChannelIds(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 
 	plan := &ch10.StructuralPlan{ChannelRemap: remap}
 	outPath := ctx.InputFile + ".fixed.ch10"
-	if err := ch10.RewriteWithPlan(ctx.InputFile, outPath, ctx.Profile, ctx.Index, plan); err != nil {
-		diag.Severity = ERROR
-		diag.Message = "failed to rewrite file with new channel id"
-		return diag, false, err
-	}
+	baseName := filepath.Base(outPath)
 
 	diag.FixSuggested = true
-	diag.FixApplied = true
-	diag.FixPatchId = filepath.Base(outPath)
-	diag.Message = fmt.Sprintf("remapped %d packet(s) from channel id 0 to %d, wrote %s", zeroCount, newID, filepath.Base(outPath))
+	diag.ChannelId = int(newID)
 	if firstIdx >= 0 && firstPkt != nil {
 		diag.PacketIndex = firstIdx
-		diag.ChannelId = int(newID)
 		diag.Offset = fmt.Sprintf("0x%X", firstPkt.Offset)
 		if firstPkt.TimeStampUs >= 0 {
 			diag.TimestampUs = int64Ptr(firstPkt.TimeStampUs)
@@ -636,6 +651,21 @@ func RemapChannelIds(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 			diag.TimestampSource = stringPtr(src)
 		}
 	}
+
+	if isDryRun(ctx) {
+		diag.Message = fmt.Sprintf("would remap %d packet(s) from channel id 0 to %d, writing %s", zeroCount, newID, baseName)
+		return diag, false, nil
+	}
+
+	if err := ch10.RewriteWithPlan(ctx.InputFile, outPath, ctx.Profile, ctx.Index, plan); err != nil {
+		diag.Severity = ERROR
+		diag.Message = "failed to rewrite file with new channel id"
+		return diag, false, err
+	}
+
+	diag.FixApplied = true
+	diag.FixPatchId = baseName
+	diag.Message = fmt.Sprintf("remapped %d packet(s) from channel id 0 to %d, wrote %s", zeroCount, newID, baseName)
 
 	if tmatsPath, err := annotateTMATSModified(ctx, rule, "Channel ID remap"); err != nil {
 		diag.Severity = WARN
@@ -709,16 +739,8 @@ func RenumberSeq(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 	}
 
 	outPath := ctx.InputFile + ".fixed.ch10"
-	if err := ch10.RewriteWithPlan(ctx.InputFile, outPath, ctx.Profile, ctx.Index, plan); err != nil {
-		diag.Severity = ERROR
-		diag.Message = "failed to renumber channel sequences"
-		return diag, false, err
-	}
-
+	baseName := filepath.Base(outPath)
 	diag.FixSuggested = true
-	diag.FixApplied = true
-	diag.FixPatchId = filepath.Base(outPath)
-	diag.Message = fmt.Sprintf("renumbered sequences for %d channel(s), wrote %s", len(channels), filepath.Base(outPath))
 	firstCh := channels[0]
 	if st := states[firstCh]; st != nil && st.firstPkt != nil {
 		diag.PacketIndex = st.firstIdx
@@ -730,6 +752,21 @@ func RenumberSeq(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 			diag.TimestampSource = stringPtr(src)
 		}
 	}
+
+	if isDryRun(ctx) {
+		diag.Message = fmt.Sprintf("would renumber sequences for %d channel(s), writing %s", len(channels), baseName)
+		return diag, false, nil
+	}
+
+	if err := ch10.RewriteWithPlan(ctx.InputFile, outPath, ctx.Profile, ctx.Index, plan); err != nil {
+		diag.Severity = ERROR
+		diag.Message = "failed to renumber channel sequences"
+		return diag, false, err
+	}
+
+	diag.FixApplied = true
+	diag.FixPatchId = baseName
+	diag.Message = fmt.Sprintf("renumbered sequences for %d channel(s), wrote %s", len(channels), baseName)
 
 	if tmatsPath, err := annotateTMATSModified(ctx, rule, "Sequence renumber"); err != nil {
 		diag.Severity = WARN
@@ -757,6 +794,9 @@ func BlockUnknownDataType(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 
 func annotateTMATSModified(ctx *Context, rule Rule, detail string) (string, error) {
 	if ctx == nil || ctx.TMATSFile == "" {
+		return "", nil
+	}
+	if isDryRun(ctx) {
 		return "", nil
 	}
 	doc, err := tmats.Parse(ctx.TMATSFile)
@@ -963,22 +1003,14 @@ func EnsureTimePacket(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 	}
 
 	outPath := ctx.InputFile + ".fixed.ch10"
-	if err := ch10.RewriteWithPlan(ctx.InputFile, outPath, ctx.Profile, ctx.Index, plan); err != nil {
-		diag.Severity = ERROR
-		diag.Message = "failed to insert time packet"
-		return diag, false, err
-	}
-
+	baseName := filepath.Base(outPath)
 	reason := "missing time packet"
 	if idx.HasTimePacket && !idx.TimeSeenBeforeDynamic {
 		reason = "time packet observed after dynamic data"
 	}
 
 	diag.FixSuggested = true
-	diag.FixApplied = true
-	diag.FixPatchId = filepath.Base(outPath)
 	diag.Severity = INFO
-	diag.Message = fmt.Sprintf("inserted time reference packet on channel %d (%s), wrote %s", channelID, reason, filepath.Base(outPath))
 	diag.ChannelId = int(channelID)
 	diag.PacketIndex = insertBefore
 	if insertBefore >= 0 && insertBefore < len(idx.Packets) {
@@ -992,6 +1024,21 @@ func EnsureTimePacket(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 	diag.TimestampUs = int64Ptr(timestamp)
 	src := string(ch10.TimestampSourceTimePacket)
 	diag.TimestampSource = stringPtr(src)
+
+	if isDryRun(ctx) {
+		diag.Message = fmt.Sprintf("would insert time reference packet on channel %d (%s), writing %s", channelID, reason, baseName)
+		return diag, false, nil
+	}
+
+	if err := ch10.RewriteWithPlan(ctx.InputFile, outPath, ctx.Profile, ctx.Index, plan); err != nil {
+		diag.Severity = ERROR
+		diag.Message = "failed to insert time packet"
+		return diag, false, err
+	}
+
+	diag.FixApplied = true
+	diag.FixPatchId = baseName
+	diag.Message = fmt.Sprintf("inserted time reference packet on channel %d (%s), wrote %s", channelID, reason, baseName)
 
 	if tmatsPath, err := annotateTMATSModified(ctx, rule, fmt.Sprintf("Inserted time packet (%s)", reason)); err != nil {
 		diag.Severity = WARN
@@ -1246,6 +1293,18 @@ func FixPCMAlign(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 		return diag, false, nil
 	}
 
+	diag.FixSuggested = true
+	if firstFixIdx >= 0 && firstPkt != nil {
+		diag.PacketIndex = firstFixIdx
+		diag.ChannelId = int(firstPkt.ChannelID)
+		diag.Offset = fmt.Sprintf("0x%X", firstPkt.Offset)
+	}
+
+	if isDryRun(ctx) {
+		diag.Message = fmt.Sprintf("would fix PCM alignment on %d packet(s) (%d header, %d filler)", modifiedPackets, headerFixes, fillerFixes)
+		return diag, false, nil
+	}
+
 	if err := appendAuditEntries(ctx, rule, edits); err != nil {
 		diag.Severity = ERROR
 		diag.Message = fmt.Sprintf("failed to record audit trail: %v", err)
@@ -1258,13 +1317,7 @@ func FixPCMAlign(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 		return diag, false, err
 	}
 
-	diag.FixSuggested = true
 	diag.Message = fmt.Sprintf("fixed PCM alignment on %d packet(s) (%d header, %d filler)", modifiedPackets, headerFixes, fillerFixes)
-	if firstFixIdx >= 0 && firstPkt != nil {
-		diag.PacketIndex = firstFixIdx
-		diag.ChannelId = int(firstPkt.ChannelID)
-		diag.Offset = fmt.Sprintf("0x%X", firstPkt.Offset)
-	}
 	return diag, true, nil
 }
 
@@ -1459,13 +1512,7 @@ func FixA429Gap(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 		return diag, false, nil
 	}
 
-	outPath, err := ch10.RewriteA429WithSplits(ctx.InputFile, ctx.Profile, ctx.Index, splits)
-	if err != nil {
-		diag.Severity = ERROR
-		diag.Message = "failed to rewrite ARINC-429 packets"
-		return diag, false, err
-	}
-
+	diag.FixSuggested = true
 	diag.PacketIndex = firstPktIdx
 	diag.ChannelId = int(firstPacket.ChannelID)
 	diag.Offset = fmt.Sprintf("0x%X", firstPacket.Offset)
@@ -1475,15 +1522,32 @@ func FixA429Gap(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 		src := string(firstPacket.Source)
 		diag.TimestampSource = stringPtr(src)
 	}
-	if firstWordIdx >= 0 && firstPacket.A429 != nil && firstWordIdx < len(firstPacket.A429.Words) {
-		gapMs := float64(firstPacket.A429.Words[firstWordIdx].GapTime0p1Us) / 10000.0
-		diag.Message = fmt.Sprintf("fixed %d ARINC-429 gap violation(s), worst gap %.3f ms, wrote %s", violations, gapMs, filepath.Base(outPath))
-	} else {
-		diag.Message = fmt.Sprintf("fixed %d ARINC-429 gap violation(s), wrote %s", violations, filepath.Base(outPath))
+
+	formatMessage := func(verb, action, base string) string {
+		if firstWordIdx >= 0 && firstPacket.A429 != nil && firstWordIdx < len(firstPacket.A429.Words) {
+			gapMs := float64(firstPacket.A429.Words[firstWordIdx].GapTime0p1Us) / 10000.0
+			return fmt.Sprintf("%s %d ARINC-429 gap violation(s), worst gap %.3f ms, %s %s", verb, violations, gapMs, action, base)
+		}
+		return fmt.Sprintf("%s %d ARINC-429 gap violation(s), %s %s", verb, violations, action, base)
 	}
-	diag.FixSuggested = true
+
+	expectedBase := filepath.Base(ctx.InputFile + ".fixed.ch10")
+	if isDryRun(ctx) {
+		diag.Message = formatMessage("would fix", "writing", expectedBase)
+		return diag, false, nil
+	}
+
+	outPath, err := ch10.RewriteA429WithSplits(ctx.InputFile, ctx.Profile, ctx.Index, splits)
+	if err != nil {
+		diag.Severity = ERROR
+		diag.Message = "failed to rewrite ARINC-429 packets"
+		return diag, false, err
+	}
+
+	baseName := filepath.Base(outPath)
+	diag.Message = formatMessage("fixed", "wrote", baseName)
 	diag.FixApplied = true
-	diag.FixPatchId = filepath.Base(outPath)
+	diag.FixPatchId = baseName
 	if tmatsPath, err := annotateTMATSModified(ctx, rule, "ARINC-429 gap repair"); err != nil {
 		diag.Severity = WARN
 		diag.Message += fmt.Sprintf(" (TMATS update failed: %v)", err)
@@ -1993,28 +2057,38 @@ func AddEthIPH(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 	}
 
 	outPath := ctx.InputFile + ".fixed.ch10"
-	if err := ch10.RewriteWithInsertions(ctx.InputFile, outPath, ctx.Profile, inserts); err != nil {
-		diag.Severity = ERROR
-		diag.Message = "failed to insert Ethernet IPH"
-		return diag, false, err
-	}
-
-	diag.Message = fmt.Sprintf("inserted %d Ethernet IPH header(s), wrote %s", framesFixed, filepath.Base(outPath))
+	baseName := filepath.Base(outPath)
 	diag.FixSuggested = true
-	diag.FixApplied = true
-	diag.FixPatchId = filepath.Base(outPath)
 	diag.File = ctx.InputFile
 	if firstPktIdx >= 0 {
 		diag.PacketIndex = firstPktIdx
 		diag.ChannelId = int(firstPacket.ChannelID)
 		diag.Offset = fmt.Sprintf("0x%X", firstPacket.Offset)
-		diag.Message += fmt.Sprintf(" (first fix packet %d frame %d)", firstPktIdx, firstFrameIdx)
 		if firstPacket.TimeStampUs >= 0 {
 			diag.TimestampUs = int64Ptr(firstPacket.TimeStampUs)
 			src := string(firstPacket.Source)
 			diag.TimestampSource = stringPtr(src)
 		}
 	}
+	suffix := ""
+	if firstPktIdx >= 0 {
+		suffix = fmt.Sprintf(" (first fix packet %d frame %d)", firstPktIdx, firstFrameIdx)
+	}
+
+	if isDryRun(ctx) {
+		diag.Message = fmt.Sprintf("would insert %d Ethernet IPH header(s), writing %s%s", framesFixed, baseName, suffix)
+		return diag, false, nil
+	}
+
+	if err := ch10.RewriteWithInsertions(ctx.InputFile, outPath, ctx.Profile, inserts); err != nil {
+		diag.Severity = ERROR
+		diag.Message = "failed to insert Ethernet IPH"
+		return diag, false, err
+	}
+
+	diag.Message = fmt.Sprintf("inserted %d Ethernet IPH header(s), wrote %s%s", framesFixed, baseName, suffix)
+	diag.FixApplied = true
+	diag.FixPatchId = baseName
 	if tmatsPath, err := annotateTMATSModified(ctx, rule, "Ethernet IPH insertion"); err != nil {
 		diag.Severity = WARN
 		diag.Message += fmt.Sprintf(" (TMATS update failed: %v)", err)
@@ -2186,6 +2260,27 @@ func FixA664Lens(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 		return diag, false, nil
 	}
 
+	diag.FixSuggested = true
+	if firstPktIdx >= 0 {
+		diag.PacketIndex = firstPktIdx
+		diag.ChannelId = int(firstPacket.ChannelID)
+		diag.Offset = fmt.Sprintf("0x%X", firstPacket.Offset)
+		if firstPacket.TimeStampUs >= 0 {
+			diag.TimestampUs = int64Ptr(firstPacket.TimeStampUs)
+			src := string(firstPacket.Source)
+			diag.TimestampSource = stringPtr(src)
+		}
+	}
+	suffix := ""
+	if firstPktIdx >= 0 {
+		suffix = fmt.Sprintf(" (first fix packet %d message %d)", firstPktIdx, firstMsgIdx)
+	}
+
+	if isDryRun(ctx) {
+		diag.Message = fmt.Sprintf("would fix %d A664 message(s)%s", messagesFix, suffix)
+		return diag, false, nil
+	}
+
 	if err := appendAuditEntries(ctx, rule, edits); err != nil {
 		diag.Severity = ERROR
 		diag.Message = fmt.Sprintf("failed to record audit trail: %v", err)
@@ -2198,41 +2293,46 @@ func FixA664Lens(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 		return diag, false, err
 	}
 
-	diag.Message = fmt.Sprintf("fixed %d A664 message(s)", messagesFix)
-	diag.FixSuggested = true
+	diag.Message = fmt.Sprintf("fixed %d A664 message(s)%s", messagesFix, suffix)
 	diag.FixApplied = true
-	if firstPktIdx >= 0 {
-		diag.PacketIndex = firstPktIdx
-		diag.ChannelId = int(firstPacket.ChannelID)
-		diag.Offset = fmt.Sprintf("0x%X", firstPacket.Offset)
-		diag.Message += fmt.Sprintf(" (first fix packet %d message %d)", firstPktIdx, firstMsgIdx)
-		if firstPacket.TimeStampUs >= 0 {
-			diag.TimestampUs = int64Ptr(firstPacket.TimeStampUs)
-			src := string(firstPacket.Source)
-			diag.TimestampSource = stringPtr(src)
-		}
-	}
 	return diag, true, nil
 }
 
 func UpdateTMATSDigest(ctx *Context, rule Rule) (Diagnostic, bool, error) {
+	diag := Diagnostic{Ts: time.Now(), File: ctx.TMATSFile, RuleId: rule.RuleId, Severity: INFO, Refs: rule.Refs}
 	if ctx.TMATSFile == "" {
-		return Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: WARN, Message: "no TMATS provided", Refs: rule.Refs}, false, nil
+		diag.File = ctx.InputFile
+		diag.Severity = WARN
+		diag.Message = "no TMATS provided"
+		return diag, false, nil
 	}
 	doc, err := tmats.Parse(ctx.TMATSFile)
 	if err != nil {
-		return Diagnostic{Ts: time.Now(), File: ctx.TMATSFile, RuleId: rule.RuleId, Severity: ERROR, Message: "TMATS parse failed", Refs: rule.Refs}, false, err
+		diag.Severity = ERROR
+		diag.Message = "TMATS parse failed"
+		return diag, false, err
 	}
 	digest, err := doc.ComputeDigest()
 	if err != nil {
-		return Diagnostic{Ts: time.Now(), File: ctx.TMATSFile, RuleId: rule.RuleId, Severity: ERROR, Message: "digest compute failed", Refs: rule.Refs}, false, err
+		diag.Severity = ERROR
+		diag.Message = "digest compute failed"
+		return diag, false, err
 	}
 	doc.Set("G\\SHA", digest)
 	outPath := ctx.TMATSFile + ".fixed"
-	if err := os.WriteFile(outPath, []byte(doc.String()), 0644); err != nil {
-		return Diagnostic{Ts: time.Now(), File: ctx.TMATSFile, RuleId: rule.RuleId, Severity: ERROR, Message: "cannot write fixed TMATS", Refs: rule.Refs}, false, err
+	base := filepath.Base(outPath)
+	diag.FixSuggested = true
+	if isDryRun(ctx) {
+		diag.Message = "would update TMATS digest, writing " + base
+		return diag, false, nil
 	}
-	return Diagnostic{Ts: time.Now(), File: ctx.TMATSFile, RuleId: rule.RuleId, Severity: INFO, Message: "TMATS digest updated, wrote " + filepath.Base(outPath), Refs: rule.Refs, FixSuggested: true}, true, nil
+	if err := os.WriteFile(outPath, []byte(doc.String()), 0644); err != nil {
+		diag.Severity = ERROR
+		diag.Message = "cannot write fixed TMATS"
+		return diag, false, err
+	}
+	diag.Message = "TMATS digest updated, wrote " + base
+	return diag, true, nil
 }
 
 func NormalizeTMATSChannelMap(ctx *Context, rule Rule) (Diagnostic, bool, error) {
@@ -2350,14 +2450,19 @@ func NormalizeTMATSChannelMap(ctx *Context, rule Rule) (Diagnostic, bool, error)
 	}
 
 	outPath := ctx.TMATSFile + ".fixed"
+	base := filepath.Base(outPath)
+	diag.FixSuggested = true
+	if isDryRun(ctx) {
+		diag.Message = fmt.Sprintf("would normalize TMATS channel map for %d channels, writing %s", len(ids), base)
+		return diag, false, nil
+	}
 	if err := os.WriteFile(outPath, []byte(doc.String()), 0644); err != nil {
 		diag.Severity = ERROR
 		diag.Message = "cannot write fixed TMATS"
 		return diag, false, err
 	}
 
-	diag.Message = fmt.Sprintf("TMATS channel map normalized for %d channels, wrote %s", len(ids), filepath.Base(outPath))
-	diag.FixSuggested = true
+	diag.Message = fmt.Sprintf("TMATS channel map normalized for %d channels, wrote %s", len(ids), base)
 	return diag, true, nil
 }
 
@@ -2516,15 +2621,26 @@ func SyncSecondaryTimeFmt(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 }
 
 func FixFileExtension(ctx *Context, rule Rule) (Diagnostic, bool, error) {
+	diag := Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: INFO, Refs: rule.Refs}
 	ext := filepath.Ext(ctx.InputFile)
 	if ext == ".ch10" || ext == ".tf10" || ext == ".df10" {
-		return Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: INFO, Message: "extension ok", Refs: rule.Refs}, false, nil
+		diag.Message = "extension ok"
+		return diag, false, nil
 	}
 	newPath := ctx.InputFile + ".ch10"
-	if err := copyFile(ctx.InputFile, newPath); err != nil {
-		return Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: ERROR, Message: "cannot copy with .ch10", Refs: rule.Refs}, false, err
+	base := filepath.Base(newPath)
+	diag.FixSuggested = true
+	if isDryRun(ctx) {
+		diag.Message = "would copy to " + base
+		return diag, false, nil
 	}
-	return Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: INFO, Message: "copied to " + filepath.Base(newPath), Refs: rule.Refs, FixSuggested: true}, true, nil
+	if err := copyFile(ctx.InputFile, newPath); err != nil {
+		diag.Severity = ERROR
+		diag.Message = "cannot copy with .ch10"
+		return diag, false, err
+	}
+	diag.Message = "copied to " + base
+	return diag, true, nil
 }
 
 func ValidateOrRebuildDirectory(ctx *Context, rule Rule) (Diagnostic, bool, error) {
@@ -2612,6 +2728,15 @@ func ValidateOrRebuildDirectory(ctx *Context, rule Rule) (Diagnostic, bool, erro
 
 	base := strings.TrimSuffix(ctx.InputFile, ext)
 	outPath := base + ".fixed" + ext
+	baseName := filepath.Base(outPath)
+	diag.FixSuggested = true
+
+	if isDryRun(ctx) {
+		message := fmt.Sprintf("would rebuild directory (blockSize=%d, entries=%d) -> %s", plan.BlockSize, len(plan.Entries), baseName)
+		diag.Message = message
+		return diag, false, nil
+	}
+
 	if err := ch10.RewriteTransferFileWithDirectory(ctx.InputFile, outPath, newDir, dataOffset); err != nil {
 		diag.Severity = ERROR
 		diag.Message = fmt.Sprintf("failed to rewrite %s", filepath.Base(outPath))
@@ -2626,10 +2751,9 @@ func ValidateOrRebuildDirectory(ctx *Context, rule Rule) (Diagnostic, bool, erro
 		}
 	}
 
-	diag.FixSuggested = true
 	diag.FixApplied = true
-	diag.FixPatchId = filepath.Base(outPath)
-	message := fmt.Sprintf("rebuilt directory (blockSize=%d, entries=%d) -> %s", plan.BlockSize, len(plan.Entries), filepath.Base(outPath))
+	diag.FixPatchId = baseName
+	message := fmt.Sprintf("rebuilt directory (blockSize=%d, entries=%d) -> %s", plan.BlockSize, len(plan.Entries), baseName)
 	if len(additional) > 0 {
 		message += fmt.Sprintf(", extracted %s", strings.Join(additional, ", "))
 	}

@@ -1,0 +1,325 @@
+{
+  "rulePackId": "starter-106-09",
+  "version": "1.0.0",
+  "profile": "106-09",
+  "rules": [
+    {
+      "ruleId": "RP-0001",
+      "name": "SyncPattern",
+      "scope": "packet",
+      "stage": "header",
+      "severity": "ERROR",
+      "fixable": false,
+      "fixFunction": "CheckSyncPattern",
+      "refs": [
+        "10.6.1.1(a)"
+      ],
+      "message": "Packet Sync Pattern must be 0xEB25"
+    },
+    {
+      "ruleId": "RP-0002",
+      "name": "HeaderChecksum",
+      "scope": "packet",
+      "stage": "header",
+      "severity": "ERROR",
+      "fixable": true,
+      "fixFunction": "FixHeaderChecksum",
+      "refs": [
+        "10.6.1.1(j)"
+      ],
+      "message": "Header checksum must be correct"
+    },
+    {
+      "ruleId": "RP-0003",
+      "name": "DataChecksumTrailer",
+      "scope": "packet",
+      "stage": "header",
+      "severity": "ERROR",
+      "fixable": true,
+      "fixFunction": "FixDataChecksumOrTrailer",
+      "refs": [
+        "10.6.1.3"
+      ],
+      "message": "Data checksum/trailer consistency"
+    },
+    {
+      "ruleId": "RP-0004",
+      "name": "SecondaryHeaderFlag",
+      "scope": "packet",
+      "stage": "header",
+      "severity": "ERROR",
+      "fixable": true,
+      "fixFunction": "SyncSecondaryHeaderFlag",
+      "refs": [
+        "10.6.1.2"
+      ],
+      "message": "Secondary header flag must match content"
+    },
+    {
+      "ruleId": "RP-0005",
+      "name": "Lengths",
+      "scope": "packet",
+      "stage": "header",
+      "severity": "ERROR",
+      "fixable": true,
+      "fixFunction": "FixLengths",
+      "refs": [
+        "10.6.1.1(c)",
+        "10.6.1.1(d)"
+      ],
+      "message": "Packet/Data length must be consistent"
+    },
+    {
+      "ruleId": "RP-0006",
+      "name": "ChannelId",
+      "scope": "file",
+      "stage": "struct-write",
+      "severity": "ERROR",
+      "fixable": true,
+      "fixFunction": "RemapChannelIds",
+      "refs": [
+        "10.6.1.1(b)",
+        "Ch.9 R-x\\NSB"
+      ],
+      "message": "Channel ID cannot be 0 and must be unique"
+    },
+    {
+      "ruleId": "RP-0007",
+      "name": "Sequence",
+      "scope": "channel",
+      "stage": "struct-write",
+      "severity": "WARN",
+      "fixable": true,
+      "fixFunction": "RenumberSeq",
+      "refs": [
+        "10.6.1.1(f)"
+      ],
+      "message": "Sequence must be continuous per channel"
+    },
+    {
+      "ruleId": "RP-0008",
+      "name": "DataTypeKnown",
+      "scope": "packet",
+      "stage": "header",
+      "severity": "ERROR",
+      "fixable": false,
+      "fixFunction": "BlockUnknownDataType",
+      "refs": [
+        "Table 10-10"
+      ],
+      "message": "Data type must be valid"
+    },
+    {
+      "ruleId": "RP-0009",
+      "name": "TimePacketFirst",
+      "scope": "file",
+      "stage": "time",
+      "severity": "ERROR",
+      "fixable": true,
+      "fixFunction": "EnsureTimePacket",
+      "refs": [
+        "10.5.1(b)",
+        "10.6.3.2"
+      ],
+      "message": "Time packet must be present early"
+    },
+    {
+      "ruleId": "RP-0010",
+      "name": "PCMAlign",
+      "scope": "packet",
+      "stage": "type-specific",
+      "appliesTo": {
+        "dataTypes": [
+          8
+        ]
+      },
+      "severity": "ERROR",
+      "fixable": true,
+      "fixFunction": "FixPCMAlign",
+      "refs": [
+        "10.6.2(c-f)"
+      ],
+      "message": "PCM alignment must be correct"
+    },
+    {
+      "ruleId": "RP-0011",
+      "name": "1553IpdhLen",
+      "scope": "packet",
+      "stage": "type-specific",
+      "appliesTo": {
+        "dataTypes": [
+          25
+        ]
+      },
+      "severity": "ERROR",
+      "fixable": false,
+      "fixFunction": "Check1553IpdhLen",
+      "refs": [
+        "10.6.4.3"
+      ],
+      "message": "1553 16PP194 IPDH length must be 0x18"
+    },
+    {
+      "ruleId": "RP-0012",
+      "name": "1553TTBWarn",
+      "scope": "packet",
+      "stage": "type-specific",
+      "appliesTo": {
+        "dataTypes": [
+          24
+        ]
+      },
+      "severity": "WARN",
+      "fixable": false,
+      "fixFunction": "Warn1553Ttb",
+      "refs": [
+        "10.6.4.2(a)"
+      ],
+      "message": "TTB out-of-context"
+    },
+    {
+      "ruleId": "RP-0013",
+      "name": "A429Gap",
+      "scope": "channel",
+      "stage": "struct-write",
+      "severity": "ERROR",
+      "fixable": true,
+      "fixFunction": "FixA429Gap",
+      "refs": [
+        "10.6.8"
+      ],
+      "message": "ARINC-429 GAP must be <=100ms"
+    },
+    {
+      "ruleId": "RP-0014",
+      "name": "A429ParityWarn",
+      "scope": "packet",
+      "stage": "type-specific",
+      "appliesTo": {
+        "dataTypes": [
+          56
+        ]
+      },
+      "severity": "WARN",
+      "fixable": false,
+      "fixFunction": "WarnA429Parity",
+      "refs": [
+        "10.6.8"
+      ],
+      "message": "ARINC-429 parity flag set"
+    },
+    {
+      "ruleId": "RP-0015",
+      "name": "EthIPH",
+      "scope": "packet",
+      "stage": "struct-write",
+      "severity": "ERROR",
+      "fixable": true,
+      "fixFunction": "AddEthIPH",
+      "refs": [
+        "10.6.15.1"
+      ],
+      "message": "Ethernet Fmt0 IPH must exist"
+    },
+    {
+      "ruleId": "RP-0016",
+      "name": "A664Lens",
+      "scope": "packet",
+      "stage": "type-specific",
+      "appliesTo": {
+        "dataTypes": [
+          81
+        ]
+      },
+      "severity": "ERROR",
+      "fixable": true,
+      "fixFunction": "FixA664Lens",
+      "refs": [
+        "10.6.15.2"
+      ],
+      "message": "A664 length fields must match"
+    },
+    {
+      "ruleId": "RP-0017",
+      "name": "TMATSDigest",
+      "scope": "tmats",
+      "stage": "tmats",
+      "severity": "ERROR",
+      "fixable": true,
+      "fixFunction": "UpdateTMATSDigest",
+      "refs": [
+        "Ch.9 Table 9-2 G\\SHA"
+      ],
+      "message": "TMATS digest must exist and be correct"
+    },
+    {
+      "ruleId": "RP-0018",
+      "name": "TMATSChannelMap",
+      "scope": "tmats",
+      "stage": "tmats",
+      "severity": "ERROR",
+      "fixable": true,
+      "fixFunction": "NormalizeTMATSChannelMap",
+      "refs": [
+        "Ch.9 R-x\\CDT-n",
+        "Ch.9 R-x\\CHE-n"
+      ],
+      "message": "TMATS channel/types must match Ch.10"
+    },
+    {
+      "ruleId": "RP-0019",
+      "name": "SecondaryTimeFmt",
+      "scope": "file",
+      "stage": "time",
+      "severity": "ERROR",
+      "fixable": true,
+      "fixFunction": "SyncSecondaryTimeFmt",
+      "refs": [
+        "10.6.1.2",
+        "Ch.9 R-x\\SHTF-n"
+      ],
+      "message": "Secondary time format flags must match"
+    },
+    {
+      "ruleId": "RP-0020",
+      "name": "FileExt",
+      "scope": "file",
+      "stage": "struct-write",
+      "severity": "WARN",
+      "fixable": true,
+      "fixFunction": "FixFileExtension",
+      "refs": [
+        "10.11.3/5"
+      ],
+      "message": "File should have .ch10/.tf10 extension"
+    },
+    {
+      "ruleId": "RP-0021",
+      "name": "DirectoryChain",
+      "scope": "file",
+      "stage": "struct-write",
+      "severity": "ERROR",
+      "fixable": true,
+      "fixFunction": "ValidateOrRebuildDirectory",
+      "refs": [
+        "10.5.2",
+        "10.11.5",
+        "10.11.6"
+      ],
+      "message": "Transfer/directory files must contain a valid directory chain"
+    },
+    {
+      "ruleId": "RP-0022",
+      "name": "DictionaryCompliance",
+      "scope": "file",
+      "stage": "type-specific",
+      "severity": "WARN",
+      "fixable": false,
+      "fixFunction": "ValidateAgainstDictionaries",
+      "refs": [
+        "Vendor ICD"
+      ],
+      "message": "Validate telemetry words against ICD dictionaries"
+    }
+  ]
+}

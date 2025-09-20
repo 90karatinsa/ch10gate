@@ -57,7 +57,7 @@ func TestBatchCmdGeneratesOutputs(t *testing.T) {
 		t.Fatalf("WriteFile beta tmats: %v", err)
 	}
 
-	rulesPath := filepath.Join("..", "..", "profiles", "106-15", "rules-min.json")
+	rulesPath := filepath.Join("..", "..", "profiles", "106-15", "rules.json")
 
 	batchCmd([]string{
 		"--in", inputDir,
