@@ -12,6 +12,9 @@ func NewRouter(s *Server) (http.Handler, error) {
 	mux.HandleFunc("/upload", s.handleUpload)
 	mux.HandleFunc("/openapi.yaml", s.handleOpenAPI)
 	mux.HandleFunc("/artifacts/", s.handleArtifactDownload)
+	if s.enableAdmin && s.updateInstaller != nil {
+		mux.HandleFunc("/admin/update", s.handleAdminUpdate)
+	}
 	ui, err := newUIHandler()
 	if err != nil {
 		return nil, err
