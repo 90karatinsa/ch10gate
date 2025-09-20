@@ -3,9 +3,38 @@ info:
   title: CH10 Gate Validator API
   version: "1.0"
 paths:
+  /upload:
+    post:
+      summary: Upload Chapter 10 or TMATS files
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                files:
+                  type: array
+                  items:
+                    type: string
+                    format: binary
+                  description: Files to upload
+              required: [files]
+      responses:
+        "200":
+          description: Uploaded files registered as artifacts
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadResponse"
   /validate:
     post:
       summary: Validate inputs and produce diagnostics + acceptance
+      parameters:
+        - name: stream
+          in: query
+          schema: {type: boolean}
+          description: When true, emit diagnostics as an application/x-ndjson stream.
       requestBody:
         required: true
         content:
@@ -14,17 +43,34 @@ paths:
               type: object
               required: [inputs, profile]
               properties:
-                inputs: {type: array, items: {type: string, description: "paths"}}
-                tmats: {type: string}
-                profile: {enum: ["106-09","106-11","106-13","106-15","106-20"]}
-                rulePack: {type: object}
+                inputs:
+                  type: array
+                  items:
+                    type: string
+                  description: Artifact IDs or file paths for Chapter 10 inputs
+                tmats:
+                  type: string
+                  description: Artifact ID or file path for TMATS metadata
+                profile:
+                  type: string
+                  enum: ["106-09", "106-11", "106-13", "106-15", "106-20"]
+                rulePack:
+                  type: object
+                  description: Optional rule pack payload overriding defaults
+                includeTimestamps:
+                  type: boolean
+                  description: Include timestamp metadata in diagnostics output
       responses:
         "200":
-          description: acceptance JSON
+          description: Acceptance JSON or NDJSON diagnostic stream
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/AcceptanceReport"
+                $ref: "#/components/schemas/ValidateResponse"
+            application/x-ndjson:
+              schema:
+                type: string
+                description: Stream of Diagnostic entries followed by a summary object
   /auto-fix:
     post:
       summary: Apply auto-fixes where possible
@@ -34,20 +80,20 @@ paths:
           application/json:
             schema:
               type: object
-              required: [input, profile, rulePack]
+              required: [input, profile]
               properties:
                 input: {type: string}
                 tmats: {type: string}
-                output: {type: string}
                 profile: {type: string}
                 rulePack: {type: object}
                 dryRun: {type: boolean}
       responses:
         "200":
+          description: Diagnostics and generated fix artifacts
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/FixResult"
+                $ref: "#/components/schemas/AutoFixResponse"
   /manifest:
     post:
       summary: Build a manifest with hashes
@@ -57,17 +103,21 @@ paths:
           application/json:
             schema:
               type: object
-              required: [inputs, shaAlgo]
+              required: [inputs]
               properties:
                 inputs: {type: array, items: {type: string}}
-                shaAlgo: {enum: ["sha256","sha512"]}
+                shaAlgo:
+                  type: string
+                  enum: ["sha256", "sha512"]
+                  default: "sha256"
                 sign: {type: boolean}
       responses:
         "200":
+          description: Manifest JSON with artifact reference
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Manifest"
+                $ref: "#/components/schemas/ManifestResponse"
   /profiles:
     get:
       summary: List supported profiles
@@ -78,6 +128,33 @@ paths:
               schema:
                 type: array
                 items: {type: string}
+  /artifacts/{id}:
+    get:
+      summary: Download a previously generated artifact
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: Artifact contents
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "404":
+          description: Artifact not found
+  /openapi.yaml:
+    get:
+      summary: Retrieve the OpenAPI specification
+      responses:
+        "200":
+          content:
+            application/yaml:
+              schema:
+                type: string
 components:
   schemas:
     Diagnostic:
@@ -89,12 +166,24 @@ components:
         packetIndex: {type: integer}
         offset: {type: string}
         ruleId: {type: string}
-        severity: {enum: ["ERROR","WARN","INFO"]}
+        severity: {enum: ["ERROR", "WARN", "INFO"]}
         message: {type: string}
         refs: {type: array, items: {type: string}}
         fixSuggested: {type: boolean}
         fixApplied: {type: boolean}
         fixPatchId: {type: string}
+        timestamp_us: {type: integer, format: int64}
+        timestamp_source: {type: string}
+    GateResult:
+      type: object
+      properties:
+        ruleId: {type: string}
+        name: {type: string}
+        stage: {type: string}
+        severity: {type: string}
+        pass: {type: boolean}
+        findings: {type: integer}
+        refs: {type: array, items: {type: string}}
     AcceptanceReport:
       type: object
       properties:
@@ -105,21 +194,47 @@ components:
             errors: {type: integer}
             warnings: {type: integer}
             pass: {type: boolean}
+        gateMatrix:
+          type: array
+          items: {$ref: "#/components/schemas/GateResult"}
         findings:
           type: array
           items:
             $ref: "#/components/schemas/Diagnostic"
-    FixResult:
+    ArtifactRef:
       type: object
       properties:
-        outputFile: {type: string}
-        auditTrail:
+        id: {type: string}
+        name: {type: string}
+        contentType: {type: string}
+        size: {type: integer, format: int64}
+        kind: {type: string}
+    ValidateResponse:
+      type: object
+      properties:
+        acceptance:
+          $ref: "#/components/schemas/AcceptanceReport"
+        diagnostics: {type: integer}
+        artifacts:
           type: array
-          items: {type: object}
+          items:
+            $ref: "#/components/schemas/ArtifactRef"
+    AutoFixResponse:
+      type: object
+      properties:
+        diagnostics:
+          type: array
+          items:
+            $ref: "#/components/schemas/Diagnostic"
+        outputs:
+          type: array
+          items:
+            $ref: "#/components/schemas/ArtifactRef"
     Manifest:
       type: object
       properties:
         createdAt: {type: string, format: date-time}
+        shaAlgo: {type: string}
         items:
           type: array
           items:
@@ -129,7 +244,6 @@ components:
               size: {type: integer}
               sha256: {type: string}
               type: {type: string}
-        shaAlgo: {type: string}
         signature:
           type: object
           properties:
@@ -137,3 +251,17 @@ components:
             certSubject: {type: string}
             issuer: {type: string}
             signatureFile: {type: string}
+    ManifestResponse:
+      type: object
+      properties:
+        manifest:
+          $ref: "#/components/schemas/Manifest"
+        artifact:
+          $ref: "#/components/schemas/ArtifactRef"
+    UploadResponse:
+      type: object
+      properties:
+        files:
+          type: array
+          items:
+            $ref: "#/components/schemas/ArtifactRef"
