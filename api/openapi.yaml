@@ -2,6 +2,10 @@ openapi: 3.1.0
 info:
   title: CH10 Gate Validator API
   version: "1.0"
+  description: |
+    Offline-ready validation API packaged via scripts/gate_bundle.sh for
+    gated deliveries. The gate bundle ships this specification alongside
+    binaries, schemas, and sample data to support acceptance QA.
 paths:
   /upload:
     post:
