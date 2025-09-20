@@ -11,7 +11,46 @@ require_cmd() {
 require_cmd go
 require_cmd python3
 require_cmd git
-require_cmd sha256sum
+
+SHA256_CMD=""
+SHA256_ARGS=()
+
+resolve_sha256_cmd() {
+  if [ -n "${SHA256_CMD}" ]; then
+    return
+  fi
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    SHA256_CMD="sha256sum"
+    SHA256_ARGS=()
+    return
+  fi
+
+  if command -v shasum >/dev/null 2>&1; then
+    SHA256_CMD="shasum"
+    SHA256_ARGS=(-a 256)
+    return
+  fi
+
+  echo "fatal: required command 'sha256sum' or 'shasum' not found" >&2
+  exit 1
+}
+
+sha256_digest() {
+  resolve_sha256_cmd
+  "${SHA256_CMD}" "${SHA256_ARGS[@]}" "$@"
+}
+
+sha256_file() {
+  if [ "$#" -ne 1 ]; then
+    echo "fatal: sha256_file expects exactly one argument" >&2
+    exit 1
+  fi
+
+  sha256_digest "$1" | awk '{print $1}'
+}
+
+resolve_sha256_cmd
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="${ROOT_DIR}/DIST"
@@ -248,4 +287,4 @@ trap - EXIT
 cleanup_license
 
 echo "[gate-bundle] bundle ready at ${BUNDLE_DIR}"
-echo "[gate-bundle] manifest sha256: $(sha256sum "${BUNDLE_DIR}/manifest.json" | awk '{print $1}')"
+echo "[gate-bundle] manifest sha256: $(sha256_file "${BUNDLE_DIR}/manifest.json")"
