@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -48,6 +50,8 @@ func main() {
 		verifySignatureCmd(os.Args[2:])
 	case "batch":
 		batchCmd(os.Args[2:])
+	case "undo":
+		undoCmd(os.Args[2:])
 	default:
 		usage()
 	}
@@ -63,6 +67,7 @@ Commands:
   manifest  --inputs <comma-separated> --out <manifest.json> [--sign --key <key.pem> --cert <cert.pem> --jws-out <file>]
   verify-signature --manifest <manifest.json> --jws <signature.jws> --cert <cert.pem>
   batch     --in <dir> --profile <profile> --rules <rulepack.json> --out-dir <dir>
+  undo      --in <file.fixed.ch10> --audit <audit.jsonl> --out <restored.ch10>
 `, version, buildDate)
 }
 
@@ -165,11 +170,17 @@ func autofixCmd(args []string) {
 	rulesPath := fs.String("rules", "", "rulepack.json")
 	includeTimestamps := fs.Bool("diag-include-timestamps", true, "include timestamp metadata in diagnostics output")
 	concurrency := fs.Int("concurrency", 1, "maximum concurrent channel evaluations")
+	auditPath := fs.String("audit", "", "audit log output (jsonl)")
 	fs.Parse(args)
 
 	if *in == "" || *rulesPath == "" {
 		fmt.Println("required: --in, --rules")
 		os.Exit(1)
+	}
+
+	auditLogPath := *auditPath
+	if auditLogPath == "" {
+		auditLogPath = *in + ".audit.jsonl"
 	}
 
 	rp, err := rules.LoadRulePack(*rulesPath)
@@ -183,6 +194,9 @@ func autofixCmd(args []string) {
 	engine.SetConcurrency(*concurrency)
 
 	ctx := &rules.Context{InputFile: *in, TMATSFile: *tmats, Profile: *profile}
+	if auditLogPath != "" {
+		ctx.AuditLog = common.NewPatchLog(auditLogPath)
+	}
 	diags, err := engine.Eval(ctx)
 	if err != nil {
 		fmt.Println("eval:", err)
@@ -201,7 +215,137 @@ func autofixCmd(args []string) {
 	}
 	if fixes == 0 {
 		fmt.Println("No fixes applied")
+		return
 	}
+	if ctx.AuditLog != nil {
+		fmt.Printf("Audit log: %s\n", ctx.AuditLog.Path())
+	}
+}
+
+func undoCmd(args []string) {
+	fs := flag.NewFlagSet("undo", flag.ExitOnError)
+	in := fs.String("in", "", "fixed Chapter 10 file")
+	audit := fs.String("audit", "", "audit log (jsonl)")
+	out := fs.String("out", "", "restored output file")
+	fs.Parse(args)
+
+	if *in == "" || *audit == "" || *out == "" {
+		fmt.Println("required: --in, --audit, --out")
+		os.Exit(1)
+	}
+
+	entries, err := common.ReadPatchLog(*audit)
+	if err != nil {
+		fmt.Println("read audit:", err)
+		os.Exit(1)
+	}
+	if len(entries) == 0 {
+		fmt.Println("audit log is empty")
+		os.Exit(1)
+	}
+
+	patchedHash, _, err := common.Sha256OfFile(*in)
+	if err != nil {
+		fmt.Println("hash input:", err)
+		os.Exit(1)
+	}
+
+	if err := copyFile(*in, *out); err != nil {
+		fmt.Println("copy input:", err)
+		os.Exit(1)
+	}
+
+	f, err := os.OpenFile(*out, os.O_RDWR, 0)
+	if err != nil {
+		fmt.Println("open output:", err)
+		os.Exit(1)
+	}
+	defer f.Close()
+
+	mismatches := 0
+	applied := 0
+	for i := len(entries) - 1; i >= 0; i-- {
+		entry := entries[i]
+		before, err := entry.BeforeBytes()
+		if err != nil {
+			fmt.Printf("skip entry %d: decode beforeHex failed: %v\n", i, err)
+			continue
+		}
+		after, err := entry.AfterBytes()
+		if err != nil {
+			fmt.Printf("skip entry %d: decode afterHex failed: %v\n", i, err)
+			continue
+		}
+		if entry.Offset < 0 {
+			fmt.Printf("skip entry %d: invalid offset %d\n", i, entry.Offset)
+			continue
+		}
+		mismatch := false
+		if len(after) != len(before) {
+			mismatch = true
+		}
+		if len(after) > 0 {
+			buf := make([]byte, len(after))
+			if _, err := f.ReadAt(buf, entry.Offset); err != nil || !bytes.Equal(buf, after) {
+				mismatch = true
+			}
+		}
+		if len(before) > 0 {
+			if _, err := f.WriteAt(before, entry.Offset); err != nil {
+				fmt.Println("write patch:", err)
+				os.Exit(1)
+			}
+		}
+		if mismatch {
+			mismatches++
+		}
+		applied++
+	}
+
+	if err := f.Sync(); err != nil {
+		fmt.Println("sync output:", err)
+		os.Exit(1)
+	}
+
+	restoredHash, _, err := common.Sha256OfFile(*out)
+	if err != nil {
+		fmt.Println("hash restored:", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Restored %d patch(es) to %s\n", applied, *out)
+	fmt.Printf("Patched SHA256: %s\n", patchedHash)
+	fmt.Printf("Restored SHA256: %s\n", restoredHash)
+	if mismatches > 0 {
+		fmt.Printf("Warning: %d patch(es) did not match expected fixed bytes; original bytes reapplied regardless.\n", mismatches)
+	}
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	info, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(dst)
+	if dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode())
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Sync()
 }
 
 func reportCmd(args []string) {
