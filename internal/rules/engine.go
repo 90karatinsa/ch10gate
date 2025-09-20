@@ -173,6 +173,9 @@ type Engine struct {
 
 	stageBuckets map[RuleStage][]Rule
 	ruleIndex    map[string]Rule
+
+	diagnosticCallback func(Diagnostic) error
+	diagnosticErr      error
 }
 
 func NewEngine(rp RulePack) *Engine {
@@ -197,6 +200,13 @@ func (e *Engine) SetConcurrency(n int) {
 		n = 1
 	}
 	e.concurrency = n
+}
+
+func (e *Engine) SetDiagnosticCallback(cb func(Diagnostic) error) {
+	if e == nil {
+		return
+	}
+	e.diagnosticCallback = cb
 }
 
 func (e *Engine) rebuildStageBuckets() {
@@ -224,6 +234,7 @@ func (e *Engine) Eval(ctx *Context) ([]Diagnostic, error) {
 	}
 	baseIdx := ctx.Index
 	var diags []Diagnostic
+	e.diagnosticErr = nil
 	for _, stage := range stageOrder {
 		rules := e.stageBuckets[stage]
 		if len(rules) == 0 {
@@ -235,17 +246,26 @@ func (e *Engine) Eval(ctx *Context) ([]Diagnostic, error) {
 			}
 			fn, ok := e.registry[r.FixFunc]
 			if !ok {
-				diags = append(diags, Diagnostic{
+				diag := Diagnostic{
 					Ts: time.Now(), File: ctx.InputFile, RuleId: r.RuleId, Severity: WARN,
 					Message: "no function for rule", Refs: r.Refs, FixSuggested: false,
-				})
+				}
+				e.emitDiagnostic(diag)
+				diags = append(diags, diag)
 				continue
 			}
 			stageDiags := e.evaluateRule(ctx, baseIdx, r, fn)
 			diags = append(diags, stageDiags...)
+			if e.diagnosticErr != nil {
+				e.diagnostics = diags
+				return diags, e.diagnosticErr
+			}
 		}
 	}
 	e.diagnostics = diags
+	if e.diagnosticErr != nil {
+		return diags, e.diagnosticErr
+	}
 	return diags, nil
 }
 
@@ -262,6 +282,7 @@ func (e *Engine) evaluateRule(ctx *Context, baseIdx *ch10.FileIndex, rule Rule, 
 	if !executed || diag.RuleId == "" {
 		return nil
 	}
+	e.emitDiagnostic(diag)
 	return []Diagnostic{diag}
 }
 
@@ -314,7 +335,26 @@ func (e *Engine) evaluateRuleParallel(ctx *Context, baseIdx *ch10.FileIndex, rul
 	if chosen == nil {
 		return nil
 	}
+	e.emitDiagnostic(*chosen)
 	return []Diagnostic{*chosen}
+}
+
+func (e *Engine) emitDiagnostic(diag Diagnostic) {
+	if e == nil {
+		return
+	}
+	if diag.RuleId == "" {
+		return
+	}
+	if e.diagnosticCallback == nil {
+		return
+	}
+	if e.diagnosticErr != nil {
+		return
+	}
+	if err := e.diagnosticCallback(diag); err != nil {
+		e.diagnosticErr = err
+	}
 }
 
 func chooseBestDiagnostic(diags []Diagnostic) *Diagnostic {
