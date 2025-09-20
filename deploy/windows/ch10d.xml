@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ServiceInstructions xmlns="https://example.com/ch10d/service">
+  <Overview>
+    <![CDATA[
+      Install the ch10d daemon as a Windows Service using either the native
+      SC utility or the Non-Sucking Service Manager (NSSM). The service runs
+      the compiled ch10d.exe binary and points it at the configuration file
+      installed under C:\\ProgramData\\ch10d\\config.yaml. Log rotation is
+      handled by the application itself; ensure that the directory referenced
+      by the configuration file (for example C:\\ProgramData\\ch10d\\logs)
+      exists and is writable by the service account.
+    ]]>
+  </Overview>
+  <SC>
+    <Command>sc create ch10d binPath= "C:\\Program Files\\ch10gate\\ch10d.exe -config C:\\ProgramData\\ch10d\\config.yaml" start= auto DisplayName= "Chapter 10 Gate Daemon"</Command>
+    <Command>sc description ch10d "Validates IRIG Chapter 10 recordings."</Command>
+    <Command>sc failure ch10d reset= 3600 actions= restart/5000</Command>
+  </SC>
+  <NSSM>
+    <Command>nssm install ch10d "C:\\Program Files\\ch10gate\\ch10d.exe" -config C:\\ProgramData\\ch10d\\config.yaml</Command>
+    <Parameter name="AppDirectory">C:\\Program Files\\ch10gate</Parameter>
+    <Parameter name="AppStdout">C:\\ProgramData\\ch10d\\logs\\ch10d.log</Parameter>
+    <Parameter name="AppStderr">C:\\ProgramData\\ch10d\\logs\\ch10d.log</Parameter>
+    <Parameter name="AppRotateFiles">1</Parameter>
+    <Parameter name="AppRotateSeconds">86400</Parameter>
+    <Parameter name="AppRotateBytes">52428800</Parameter>
+  </NSSM>
+  <PostInstall>
+    <![CDATA[
+      Create the service account (for example, NT SERVICE\ch10d) or run under
+      LocalService depending on organisational requirements. Grant read access
+      to the binary location and read/write access to the storage and log
+      directories referenced in config.yaml. After installation run "sc start
+      ch10d" or "nssm start ch10d" to launch the service. Verify status with
+      "sc query ch10d".
+    ]]>
+  </PostInstall>
+</ServiceInstructions>

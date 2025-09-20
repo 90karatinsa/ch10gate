@@ -1,0 +1,18 @@
+[Unit]
+Description=Chapter 10 Gate validation daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ch10d
+Group=ch10d
+WorkingDirectory=/opt/ch10gate
+Environment=LANG=en_US.UTF-8
+ExecStart=/usr/local/bin/ch10d -config /etc/ch10d/config.yaml
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=8192
+
+[Install]
+WantedBy=multi-user.target
