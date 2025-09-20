@@ -45,6 +45,7 @@ type PacketIndex struct {
 	IsTimePacket bool
 	MIL1553      *MIL1553Info
 	A429         *A429Info
+	PCM          *PCMInfo
 }
 
 type FileIndex struct {
@@ -91,4 +92,31 @@ type A429Info struct {
 	MessageCount uint32
 	Words        []A429Word
 	ParseError   string
+}
+
+type PCMMode int
+
+const (
+	PCMModeUnknown PCMMode = iota
+	PCMModeUnpacked
+	PCMModePacked
+	PCMModeThroughput
+)
+
+type PCMInfo struct {
+	CSDW            uint32
+	HasIPH          bool
+	MajorFrame      bool
+	MinorFrame      bool
+	MinorStatus     uint8
+	MajorStatus     uint8
+	AlignmentBits   int
+	Throughput      bool
+	Packed          bool
+	Unpacked        bool
+	Mode            PCMMode
+	ModeConflict    bool
+	SyncOffset      uint32
+	ReservedNonZero bool
+	ParseError      string
 }

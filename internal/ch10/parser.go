@@ -63,6 +63,68 @@ func parseSecHdrFlags(hdr *PacketHeader) (bool, uint8) {
 	return has, tf
 }
 
+const (
+	pcmBitReserved31   = uint32(1) << 31
+	pcmBitIPH          = uint32(1) << 30
+	pcmBitMajorFrame   = uint32(1) << 29
+	pcmBitMinorFrame   = uint32(1) << 28
+	pcmBitsMinorStatus = uint32(0x3) << 26
+	pcmBitsMajorStatus = uint32(0x3) << 24
+	pcmBitsReserved22  = uint32(0x3) << 22
+	pcmBitAlignment32  = uint32(1) << 21
+	pcmBitThroughput   = uint32(1) << 20
+	pcmBitPacked       = uint32(1) << 19
+	pcmBitUnpacked     = uint32(1) << 18
+	pcmMaskSyncOffset  = uint32(0x3FFFF)
+)
+
+// DecodePCMCSDW interprets the PCM channel-specific data word and returns a
+// populated PCMInfo describing the bitfield contents.
+func DecodePCMCSDW(csdw uint32) PCMInfo {
+	info := PCMInfo{CSDW: csdw}
+	info.HasIPH = csdw&pcmBitIPH != 0
+	info.MajorFrame = csdw&pcmBitMajorFrame != 0
+	info.MinorFrame = csdw&pcmBitMinorFrame != 0
+	info.MinorStatus = uint8((csdw >> 26) & 0x3)
+	info.MajorStatus = uint8((csdw >> 24) & 0x3)
+	if csdw&pcmBitAlignment32 != 0 {
+		info.AlignmentBits = 32
+	} else {
+		info.AlignmentBits = 16
+	}
+	info.Throughput = csdw&pcmBitThroughput != 0
+	info.Packed = csdw&pcmBitPacked != 0
+	info.Unpacked = csdw&pcmBitUnpacked != 0
+	modeCount := 0
+	if info.Throughput {
+		modeCount++
+	}
+	if info.Packed {
+		modeCount++
+	}
+	if info.Unpacked {
+		modeCount++
+	}
+	switch {
+	case modeCount == 1 && info.Throughput:
+		info.Mode = PCMModeThroughput
+	case modeCount == 1 && info.Packed:
+		info.Mode = PCMModePacked
+	case modeCount == 1 && info.Unpacked:
+		info.Mode = PCMModeUnpacked
+	default:
+		info.Mode = PCMModeUnknown
+		if modeCount != 1 {
+			info.ModeConflict = true
+		}
+	}
+	info.SyncOffset = csdw & pcmMaskSyncOffset
+	if csdw&pcmBitReserved31 != 0 || csdw&pcmBitsReserved22 != 0 {
+		info.ReservedNonZero = true
+	}
+	return info
+}
+
 func isTimePacket(hdr *PacketHeader) bool {
 	if hdr == nil {
 		return false
@@ -298,6 +360,16 @@ func (r *Reader) Next() (PacketHeader, PacketIndex, error) {
 				}
 				idx.MIL1553 = info
 			}
+		} else if hdr.DataType == 0x08 {
+			info, err := parsePCMPayload(r.file, payloadOffset, payloadLen)
+			if err != nil {
+				common.Logf("PCM parse error at offset %d: %v", r.offset, err)
+			} else if info != nil {
+				if info.ParseError != "" {
+					common.Logf("PCM parse warning at offset %d: %s", r.offset, info.ParseError)
+				}
+				idx.PCM = info
+			}
 		} else if hdr.DataType == 0x38 {
 			info, err := parseA429Payload(r.file, payloadOffset, payloadLen)
 			if err != nil {
@@ -430,6 +502,30 @@ func ScanFileMin(path string) (PacketHeader, FileIndex, error) {
 		return PacketHeader{}, idx, ErrNoSync
 	}
 	return hdr, idx, nil
+}
+
+func parsePCMPayload(r io.ReaderAt, offset int64, payloadLen int64) (*PCMInfo, error) {
+	info := &PCMInfo{}
+	if payloadLen <= 0 {
+		info.ParseError = "payload empty"
+		return info, nil
+	}
+	if payloadLen < 4 {
+		info.ParseError = "payload shorter than CSDW"
+		return info, nil
+	}
+	var csdwBuf [4]byte
+	n, err := r.ReadAt(csdwBuf[:], offset)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return info, err
+	}
+	if n < 4 {
+		info.ParseError = "payload shorter than CSDW"
+		return info, nil
+	}
+	decoded := DecodePCMCSDW(binary.BigEndian.Uint32(csdwBuf[:]))
+	*info = decoded
+	return info, nil
 }
 
 func parseMIL1553Payload(r io.ReaderAt, offset int64, payloadLen int64, dataType uint16) (*MIL1553Info, error) {
