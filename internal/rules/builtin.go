@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"example.com/ch10gate/internal/ch10"
+	"example.com/ch10gate/internal/eth"
 	"example.com/ch10gate/internal/tmats"
 )
 
@@ -1175,11 +1176,330 @@ func computeA429WordOffset(info *ch10.A429Info, idx int) int64 {
 }
 
 func AddEthIPH(ctx *Context, rule Rule) (Diagnostic, bool, error) {
-	return Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: WARN, Message: "Ethernet IPH add not implemented", Refs: rule.Refs}, false, ErrNotImplemented
+	diag := Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: INFO, Message: "Ethernet IPH inspection", Refs: rule.Refs}
+	if ctx == nil || ctx.InputFile == "" {
+		diag.Severity = ERROR
+		diag.Message = "no input file provided"
+		return diag, false, errors.New("no input file")
+	}
+	if ctx.Profile == "" {
+		diag.Severity = ERROR
+		diag.Message = "profile required"
+		return diag, false, errors.New("profile required")
+	}
+	if err := ctx.EnsureFileIndex(); err != nil {
+		diag.Severity = ERROR
+		diag.Message = "cannot index file"
+		return diag, false, err
+	}
+	if ctx.Index == nil || len(ctx.Index.Packets) == 0 {
+		diag.Message = "no packets to inspect"
+		return diag, false, nil
+	}
+
+	f, err := os.Open(ctx.InputFile)
+	if err != nil {
+		diag.Severity = ERROR
+		diag.Message = "cannot open input file"
+		return diag, false, err
+	}
+	defer f.Close()
+
+	const (
+		dataTypeEthernetFmt0 = 0x50
+		frameIDDataMask      = 0x3FFF
+	)
+
+	var (
+		inserts       []ch10.InsertEdit
+		framesFixed   int
+		firstPktIdx   = -1
+		firstFrameIdx int
+		firstPacket   ch10.PacketIndex
+	)
+
+	for i := range ctx.Index.Packets {
+		pkt := &ctx.Index.Packets[i]
+		if pkt.DataType != dataTypeEthernetFmt0 {
+			continue
+		}
+		dataLen := int(pkt.DataLength)
+		payloadOffset := pkt.Offset + int64(ch10PrimaryHeaderSize)
+		if pkt.HasSecHdr {
+			if dataLen < ch10SecondaryHeaderSize {
+				continue
+			}
+			payloadOffset += ch10SecondaryHeaderSize
+			dataLen -= ch10SecondaryHeaderSize
+		}
+		if dataLen <= 4 {
+			continue
+		}
+		body := make([]byte, dataLen)
+		if _, err := f.ReadAt(body, payloadOffset); err != nil {
+			diag.Severity = ERROR
+			diag.Message = fmt.Sprintf("read packet %d failed", i)
+			return diag, false, err
+		}
+		csdw := binary.BigEndian.Uint32(body[0:4])
+		if (csdw>>28)&0xF != 0 {
+			// Not format 0.
+			continue
+		}
+		frames, err := ch10.ParseEthFmt0PacketBody(body, csdw)
+		if err != nil {
+			diag.Severity = WARN
+			diag.PacketIndex = i
+			diag.ChannelId = int(pkt.ChannelID)
+			diag.Offset = fmt.Sprintf("0x%X", pkt.Offset)
+			diag.Message = fmt.Sprintf("cannot parse Ethernet payload: %v", err)
+			return diag, false, nil
+		}
+		for frameIdx, frame := range frames {
+			if frame.HasIPH {
+				continue
+			}
+			if frame.FrameLength <= 0 || frame.FrameLength > frameIDDataMask {
+				continue
+			}
+			ts := uint64(0)
+			if pkt.TimeStampUs >= 0 {
+				ts = uint64(pkt.TimeStampUs)
+			}
+			iph := make([]byte, 12)
+			binary.BigEndian.PutUint32(iph[0:4], uint32(ts&0xFFFFFFFF))
+			binary.BigEndian.PutUint32(iph[4:8], uint32((ts>>32)&0xFFFFFFFF))
+			frameID := uint32(frame.FrameLength & frameIDDataMask)
+			binary.BigEndian.PutUint32(iph[8:12], frameID)
+			inserts = append(inserts, ch10.InsertEdit{
+				PacketOffset: pkt.Offset,
+				InsertAt:     frame.FrameOffset,
+				Bytes:        iph,
+				Note:         fmt.Sprintf("pkt=%d frame=%d", i, frameIdx),
+			})
+			framesFixed++
+			if firstPktIdx < 0 {
+				firstPktIdx = i
+				firstFrameIdx = frameIdx
+				firstPacket = *pkt
+			}
+		}
+	}
+
+	if framesFixed == 0 {
+		diag.Message = "Ethernet IPH already present"
+		return diag, false, nil
+	}
+
+	outPath := ctx.InputFile + ".fixed.ch10"
+	if err := ch10.RewriteWithInsertions(ctx.InputFile, outPath, ctx.Profile, inserts); err != nil {
+		diag.Severity = ERROR
+		diag.Message = "failed to insert Ethernet IPH"
+		return diag, false, err
+	}
+
+	diag.Message = fmt.Sprintf("inserted %d Ethernet IPH header(s), wrote %s", framesFixed, filepath.Base(outPath))
+	diag.FixSuggested = true
+	diag.FixApplied = true
+	diag.FixPatchId = filepath.Base(outPath)
+	diag.File = ctx.InputFile
+	if firstPktIdx >= 0 {
+		diag.PacketIndex = firstPktIdx
+		diag.ChannelId = int(firstPacket.ChannelID)
+		diag.Offset = fmt.Sprintf("0x%X", firstPacket.Offset)
+		diag.Message += fmt.Sprintf(" (first fix packet %d frame %d)", firstPktIdx, firstFrameIdx)
+		if firstPacket.TimeStampUs >= 0 {
+			diag.TimestampUs = int64Ptr(firstPacket.TimeStampUs)
+			src := string(firstPacket.Source)
+			diag.TimestampSource = stringPtr(src)
+		}
+	}
+	return diag, true, nil
 }
 
 func FixA664Lens(ctx *Context, rule Rule) (Diagnostic, bool, error) {
-	return Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: WARN, Message: "A664 length fix not implemented", Refs: rule.Refs}, false, ErrNotImplemented
+	diag := Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: INFO, Message: "A664 length inspection", Refs: rule.Refs}
+	if ctx == nil || ctx.InputFile == "" {
+		diag.Severity = ERROR
+		diag.Message = "no input file provided"
+		return diag, false, errors.New("no input file")
+	}
+	if err := ctx.EnsureFileIndex(); err != nil {
+		diag.Severity = ERROR
+		diag.Message = "cannot index file"
+		return diag, false, err
+	}
+	if ctx.Index == nil || len(ctx.Index.Packets) == 0 {
+		diag.Message = "no packets to inspect"
+		return diag, false, nil
+	}
+
+	f, err := os.Open(ctx.InputFile)
+	if err != nil {
+		diag.Severity = ERROR
+		diag.Message = "cannot open input file"
+		return diag, false, err
+	}
+	defer f.Close()
+
+	const dataTypeEthernetFmt1 = 0x51
+
+	var (
+		edits       []ch10.PatchEdit
+		messagesFix int
+		firstPktIdx = -1
+		firstMsgIdx int
+		firstPacket ch10.PacketIndex
+	)
+
+	for i := range ctx.Index.Packets {
+		pkt := &ctx.Index.Packets[i]
+		if pkt.DataType != dataTypeEthernetFmt1 {
+			continue
+		}
+		dataLen := int(pkt.DataLength)
+		payloadOffset := pkt.Offset + int64(ch10PrimaryHeaderSize)
+		if pkt.HasSecHdr {
+			if dataLen < ch10SecondaryHeaderSize {
+				continue
+			}
+			payloadOffset += ch10SecondaryHeaderSize
+			dataLen -= ch10SecondaryHeaderSize
+		}
+		if dataLen <= 4 {
+			continue
+		}
+		body := make([]byte, dataLen)
+		if _, err := f.ReadAt(body, payloadOffset); err != nil {
+			diag.Severity = ERROR
+			diag.Message = fmt.Sprintf("read packet %d failed", i)
+			return diag, false, err
+		}
+		csdw := binary.BigEndian.Uint32(body[0:4])
+		msgs, err := ch10.ParseEthFmt1PacketBody(body, csdw)
+		if err != nil {
+			diag.Severity = WARN
+			diag.PacketIndex = i
+			diag.ChannelId = int(pkt.ChannelID)
+			diag.Offset = fmt.Sprintf("0x%X", pkt.Offset)
+			diag.Message = fmt.Sprintf("cannot parse A664 payload: %v", err)
+			return diag, false, nil
+		}
+		for msgIdx, msg := range msgs {
+			if msg.PayloadLength <= 0 || msg.PayloadLength > 0xFFFF-8 {
+				continue
+			}
+			if msg.IPv4HeaderLength <= 0 || msg.UDPOffset < msg.IPv4Offset {
+				continue
+			}
+			udpSegmentLen := msg.PayloadLength + 8
+			if msg.UDPOffset+udpSegmentLen > len(body) {
+				continue
+			}
+			if msg.IPv4Offset+msg.IPv4HeaderLength > len(body) {
+				continue
+			}
+
+			desiredUDPLen := uint16(msg.PayloadLength + 8)
+			desiredIPv4Len := uint16(msg.IPv4HeaderLength + int(desiredUDPLen))
+
+			ipv4Header := make([]byte, msg.IPv4HeaderLength)
+			copy(ipv4Header, body[msg.IPv4Offset:msg.IPv4Offset+msg.IPv4HeaderLength])
+			udpSegment := make([]byte, udpSegmentLen)
+			copy(udpSegment, body[msg.UDPOffset:msg.UDPOffset+udpSegmentLen])
+
+			oldIPv4Len := uint16(msg.IPv4TotalLength)
+			oldIPv4Checksum := binary.BigEndian.Uint16(ipv4Header[10:12])
+			oldUDPLen := msg.UDPLength
+			oldUDPChecksum := msg.UDPChecksum
+
+			binary.BigEndian.PutUint16(ipv4Header[2:4], desiredIPv4Len)
+			ipv4Header[10] = 0
+			ipv4Header[11] = 0
+			binary.BigEndian.PutUint16(udpSegment[4:6], desiredUDPLen)
+			if oldUDPChecksum != 0 {
+				udpSegment[6] = 0
+				udpSegment[7] = 0
+			}
+
+			newIPv4Checksum := eth.IPv4HeaderChecksum(ipv4Header)
+			newUDPChecksum := uint16(0)
+			if oldUDPChecksum != 0 {
+				newUDPChecksum = eth.UDPChecksum(ipv4Header, udpSegment)
+				if newUDPChecksum == 0 {
+					newUDPChecksum = 0xFFFF
+				}
+			}
+
+			bodyBase := payloadOffset
+			msgPatched := false
+
+			if oldUDPLen != desiredUDPLen {
+				edits = append(edits, ch10.PatchEdit{
+					Offset: bodyBase + int64(msg.UDPOffset+4),
+					Data:   []byte{byte(desiredUDPLen >> 8), byte(desiredUDPLen)},
+				})
+				msgPatched = true
+			}
+			if oldIPv4Len != desiredIPv4Len {
+				edits = append(edits, ch10.PatchEdit{
+					Offset: bodyBase + int64(msg.IPv4Offset+2),
+					Data:   []byte{byte(desiredIPv4Len >> 8), byte(desiredIPv4Len)},
+				})
+				msgPatched = true
+			}
+			if oldIPv4Checksum != newIPv4Checksum {
+				edits = append(edits, ch10.PatchEdit{
+					Offset: bodyBase + int64(msg.IPv4Offset+10),
+					Data:   []byte{byte(newIPv4Checksum >> 8), byte(newIPv4Checksum)},
+				})
+				msgPatched = true
+			}
+			if oldUDPChecksum != 0 && oldUDPChecksum != newUDPChecksum {
+				edits = append(edits, ch10.PatchEdit{
+					Offset: bodyBase + int64(msg.UDPOffset+6),
+					Data:   []byte{byte(newUDPChecksum >> 8), byte(newUDPChecksum)},
+				})
+				msgPatched = true
+			}
+
+			if msgPatched {
+				messagesFix++
+				if firstPktIdx < 0 {
+					firstPktIdx = i
+					firstMsgIdx = msgIdx
+					firstPacket = *pkt
+				}
+			}
+		}
+	}
+
+	if messagesFix == 0 {
+		diag.Message = "A664 lengths already consistent"
+		return diag, false, nil
+	}
+
+	if err := ch10.ApplyPatch(ctx.InputFile, edits); err != nil {
+		diag.Severity = ERROR
+		diag.Message = "failed to update A664 headers"
+		return diag, false, err
+	}
+
+	diag.Message = fmt.Sprintf("fixed %d A664 message(s)", messagesFix)
+	diag.FixSuggested = true
+	diag.FixApplied = true
+	if firstPktIdx >= 0 {
+		diag.PacketIndex = firstPktIdx
+		diag.ChannelId = int(firstPacket.ChannelID)
+		diag.Offset = fmt.Sprintf("0x%X", firstPacket.Offset)
+		diag.Message += fmt.Sprintf(" (first fix packet %d message %d)", firstPktIdx, firstMsgIdx)
+		if firstPacket.TimeStampUs >= 0 {
+			diag.TimestampUs = int64Ptr(firstPacket.TimeStampUs)
+			src := string(firstPacket.Source)
+			diag.TimestampSource = stringPtr(src)
+		}
+	}
+	return diag, true, nil
 }
 
 func UpdateTMATSDigest(ctx *Context, rule Rule) (Diagnostic, bool, error) {

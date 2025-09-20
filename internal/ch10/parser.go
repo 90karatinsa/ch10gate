@@ -9,6 +9,7 @@ import (
 	"os"
 
 	"example.com/ch10gate/internal/common"
+	"example.com/ch10gate/internal/eth"
 )
 
 const (
@@ -728,6 +729,124 @@ func parseA429Payload(r io.ReaderAt, offset int64, payloadLen int64) (*A429Info,
 		info.ParseError = fmt.Sprintf("message count mismatch: expected %d, parsed %d", info.MessageCount, len(info.Words))
 	}
 	return info, nil
+}
+
+// ParseEthFmt0PacketBody walks an Ethernet Format 0 packet payload and returns
+// information about each contained frame. The body slice should begin with the
+// CSDW and extend through the payload. The csdw argument is the decoded CSDW
+// word from the packet.
+func ParseEthFmt0PacketBody(body []byte, csdw uint32) ([]EthernetFrameView, error) {
+	if len(body) < 4 {
+		return nil, fmt.Errorf("ethernet format 0 payload too short: %d", len(body))
+	}
+	frameCount := int(csdw & 0xFFFF)
+	frames := make([]EthernetFrameView, 0, frameCount)
+	cursor := 4
+	for idx := 0; idx < frameCount; idx++ {
+		if cursor > len(body) {
+			return nil, fmt.Errorf("frame %d exceeds payload", idx)
+		}
+		remaining := len(body) - cursor
+		if remaining == 0 {
+			return nil, fmt.Errorf("frame %d truncated", idx)
+		}
+		view := EthernetFrameView{Index: idx, IPHOffset: -1}
+		hasIPH := false
+		if remaining >= 12 {
+			frameID := binary.BigEndian.Uint32(body[cursor+8 : cursor+12])
+			dataLen := int(frameID & 0x3FFF)
+			if dataLen > 0 && dataLen <= remaining-12 {
+				if _, _, _, _, parsedLen, err := eth.ParseEthernet(body[cursor+12 : cursor+12+dataLen]); err == nil && parsedLen == dataLen {
+					hasIPH = true
+					view.FrameIDWord = frameID
+					view.FrameLength = dataLen
+				}
+			}
+			if hasIPH {
+				view.HasIPH = true
+				view.IPHOffset = cursor
+				view.FrameOffset = cursor + 12
+			}
+		}
+		if !hasIPH {
+			if _, _, _, _, parsedLen, err := eth.ParseEthernet(body[cursor:]); err == nil {
+				view.FrameOffset = cursor
+				view.FrameLength = parsedLen
+			} else {
+				if frameCount == 1 {
+					view.FrameOffset = cursor
+					view.FrameLength = remaining
+				} else {
+					return nil, fmt.Errorf("frame %d missing IPH: %w", idx, err)
+				}
+			}
+		}
+		frameEnd := view.FrameOffset + view.FrameLength
+		if frameEnd > len(body) {
+			return nil, fmt.Errorf("frame %d length exceeds payload", idx)
+		}
+		frames = append(frames, view)
+		cursor = frameEnd
+	}
+	return frames, nil
+}
+
+// ParseEthFmt1PacketBody interprets an Ethernet Format 1 packet payload and
+// returns metadata for each ARINC-664 message. The body slice should begin with
+// the CSDW word.
+func ParseEthFmt1PacketBody(body []byte, csdw uint32) ([]A664MessageView, error) {
+	if len(body) < 4 {
+		return nil, fmt.Errorf("ethernet format 1 payload too short: %d", len(body))
+	}
+	iphLen := int((csdw >> 16) & 0xFFFF)
+	msgCount := int(csdw & 0xFFFF)
+	if iphLen <= 0 {
+		return nil, fmt.Errorf("invalid IPH length %d", iphLen)
+	}
+	cursor := 4
+	messages := make([]A664MessageView, 0, msgCount)
+	for idx := 0; idx < msgCount; idx++ {
+		if cursor+iphLen > len(body) {
+			return nil, fmt.Errorf("message %d truncated (iph)", idx)
+		}
+		view := A664MessageView{Index: idx, IPHOffset: cursor, IPHLength: iphLen}
+		ipdhWord1 := binary.BigEndian.Uint32(body[cursor+8 : cursor+12])
+		payloadLen := int(ipdhWord1 >> 16)
+		view.IPDHWord1 = ipdhWord1
+		view.PayloadLength = payloadLen
+		cursor += iphLen
+		if cursor >= len(body) {
+			return nil, fmt.Errorf("message %d missing payload", idx)
+		}
+		if len(body[cursor:]) < 20 {
+			return nil, fmt.Errorf("message %d payload too short for IPv4", idx)
+		}
+		ihl, totalLen, proto, _, _, _, err := eth.ParseIPv4(body[cursor:])
+		if err != nil {
+			return nil, fmt.Errorf("message %d ipv4 parse: %w", idx, err)
+		}
+		view.Proto = proto
+		view.IPv4Offset = cursor
+		view.IPv4HeaderLength = ihl
+		view.IPv4TotalLength = totalLen
+		required := ihl + 8 + payloadLen
+		if required > len(body)-cursor {
+			return nil, fmt.Errorf("message %d payload length %d exceeds available %d", idx, required, len(body)-cursor)
+		}
+		udpSlice := body[cursor:]
+		_, _, udpLen, udpChecksum, udpOff, err := eth.ParseUDP(udpSlice, ihl)
+		if err != nil {
+			return nil, fmt.Errorf("message %d udp parse: %w", idx, err)
+		}
+		view.UDPLength = udpLen
+		view.UDPChecksum = udpChecksum
+		view.UDPOffset = cursor + udpOff
+		view.DataOffset = cursor
+		view.MessageLength = required
+		cursor += required
+		messages = append(messages, view)
+	}
+	return messages, nil
 }
 
 // ComputeHeaderChecksum calculates the header checksum for the supplied
