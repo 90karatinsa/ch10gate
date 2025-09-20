@@ -234,12 +234,26 @@ func (s *Server) handleValidate(w http.ResponseWriter, r *http.Request) {
 			_ = writer.WriteObject(map[string]any{"type": "error", "error": err.Error()})
 			return
 		}
-		diagArt, err := s.addArtifact(diagPath, filepath.Base(diagPath), "application/x-ndjson", "diagnostics")
+		pdfPath, err := s.tempPath("acceptance-*.pdf")
 		if err != nil {
 			_ = writer.WriteObject(map[string]any{"type": "error", "error": err.Error()})
 			return
 		}
-		accArt, err := s.addArtifact(accPath, filepath.Base(accPath), "application/json", "acceptance")
+		if err := report.SaveAcceptancePDF(rep, pdfPath); err != nil {
+			_ = writer.WriteObject(map[string]any{"type": "error", "error": err.Error()})
+			return
+		}
+		diagArt, err := s.addArtifact(diagPath, "diagnostics.ndjson", "application/x-ndjson", "diagnostics")
+		if err != nil {
+			_ = writer.WriteObject(map[string]any{"type": "error", "error": err.Error()})
+			return
+		}
+		accArt, err := s.addArtifact(accPath, "acceptance_report.json", "application/json", "acceptance")
+		if err != nil {
+			_ = writer.WriteObject(map[string]any{"type": "error", "error": err.Error()})
+			return
+		}
+		pdfArt, err := s.addArtifact(pdfPath, "acceptance_report.pdf", "application/pdf", "acceptance")
 		if err != nil {
 			_ = writer.WriteObject(map[string]any{"type": "error", "error": err.Error()})
 			return
@@ -255,6 +269,7 @@ func (s *Server) handleValidate(w http.ResponseWriter, r *http.Request) {
 			Artifacts: []ArtifactRef{
 				toRef(diagArt),
 				toRef(accArt),
+				toRef(pdfArt),
 			},
 			Total: len(diags),
 		}
@@ -286,12 +301,26 @@ func (s *Server) handleValidate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("write acceptance: %v", err), http.StatusInternalServerError)
 		return
 	}
-	diagArt, err := s.addArtifact(diagPath, filepath.Base(diagPath), "application/x-ndjson", "diagnostics")
+	pdfPath, err := s.tempPath("acceptance-*.pdf")
+	if err != nil {
+		http.Error(w, fmt.Sprintf("acceptance pdf temp: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if err := report.SaveAcceptancePDF(rep, pdfPath); err != nil {
+		http.Error(w, fmt.Sprintf("write acceptance: %v", err), http.StatusInternalServerError)
+		return
+	}
+	diagArt, err := s.addArtifact(diagPath, "diagnostics.ndjson", "application/x-ndjson", "diagnostics")
 	if err != nil {
 		http.Error(w, fmt.Sprintf("register diagnostics: %v", err), http.StatusInternalServerError)
 		return
 	}
-	accArt, err := s.addArtifact(accPath, filepath.Base(accPath), "application/json", "acceptance")
+	accArt, err := s.addArtifact(accPath, "acceptance_report.json", "application/json", "acceptance")
+	if err != nil {
+		http.Error(w, fmt.Sprintf("register acceptance: %v", err), http.StatusInternalServerError)
+		return
+	}
+	pdfArt, err := s.addArtifact(pdfPath, "acceptance_report.pdf", "application/pdf", "acceptance")
 	if err != nil {
 		http.Error(w, fmt.Sprintf("register acceptance: %v", err), http.StatusInternalServerError)
 		return
@@ -306,6 +335,7 @@ func (s *Server) handleValidate(w http.ResponseWriter, r *http.Request) {
 		Artifacts: []ArtifactRef{
 			toRef(diagArt),
 			toRef(accArt),
+			toRef(pdfArt),
 		},
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -442,7 +472,7 @@ func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("write manifest: %v", err), http.StatusInternalServerError)
 		return
 	}
-	art, err := s.addArtifact(outPath, filepath.Base(outPath), "application/json", "manifest")
+	art, err := s.addArtifact(outPath, "manifest.json", "application/json", "manifest")
 	if err != nil {
 		http.Error(w, fmt.Sprintf("register manifest: %v", err), http.StatusInternalServerError)
 		return
