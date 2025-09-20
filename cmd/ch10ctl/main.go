@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 
 	"example.com/ch10gate/internal/manifest"
@@ -54,6 +55,7 @@ func validateCmd(args []string) {
 	outDiag := fs.String("out", "diagnostics.jsonl", "diagnostics output")
 	outAcc := fs.String("acceptance", "acceptance_report.json", "acceptance json")
 	includeTimestamps := fs.Bool("diag-include-timestamps", true, "include timestamp metadata in diagnostics output")
+	concurrency := fs.Int("concurrency", runtime.NumCPU(), "maximum concurrent channel evaluations")
 	fs.Parse(args)
 
 	if *in == "" || *rulesPath == "" {
@@ -69,6 +71,7 @@ func validateCmd(args []string) {
 	engine := rules.NewEngine(rp)
 	engine.RegisterBuiltins()
 	engine.SetConfigValue("diag.include_timestamps", *includeTimestamps)
+	engine.SetConcurrency(*concurrency)
 
 	ctx := &rules.Context{InputFile: *in, TMATSFile: *tmats, Profile: *profile}
 	diags, err := engine.Eval(ctx)
@@ -96,6 +99,7 @@ func autofixCmd(args []string) {
 	profile := fs.String("profile", "106-15", "profile")
 	rulesPath := fs.String("rules", "", "rulepack.json")
 	includeTimestamps := fs.Bool("diag-include-timestamps", true, "include timestamp metadata in diagnostics output")
+	concurrency := fs.Int("concurrency", 1, "maximum concurrent channel evaluations")
 	fs.Parse(args)
 
 	if *in == "" || *rulesPath == "" {
@@ -111,6 +115,7 @@ func autofixCmd(args []string) {
 	engine := rules.NewEngine(rp)
 	engine.RegisterBuiltins()
 	engine.SetConfigValue("diag.include_timestamps", *includeTimestamps)
+	engine.SetConcurrency(*concurrency)
 
 	ctx := &rules.Context{InputFile: *in, TMATSFile: *tmats, Profile: *profile}
 	diags, err := engine.Eval(ctx)
