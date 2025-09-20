@@ -19,23 +19,28 @@ import (
 	"example.com/ch10gate/internal/manifest"
 	"example.com/ch10gate/internal/report"
 	"example.com/ch10gate/internal/rules"
+	"example.com/ch10gate/internal/update"
 )
 
 // Server coordinates HTTP handlers and manages temporary artifacts produced by
 // validation requests.
 type Server struct {
-	artifacts   *ArtifactStore
-	workDir     string
-	uploadsDir  string
-	profilePack map[string]string
-	concurrency int
+	artifacts       *ArtifactStore
+	workDir         string
+	uploadsDir      string
+	profilePack     map[string]string
+	concurrency     int
+	updateInstaller *update.Installer
+	enableAdmin     bool
 }
 
 // Options configures server creation.
 type Options struct {
-	StorageDir   string
-	ProfilePacks map[string]string
-	Concurrency  int
+	StorageDir      string
+	ProfilePacks    map[string]string
+	Concurrency     int
+	EnableAdmin     bool
+	UpdateInstaller *update.Installer
 }
 
 // Artifact represents a file generated or stored by the daemon.
@@ -95,11 +100,13 @@ func NewServer(opts Options) (*Server, error) {
 		profilePack[profile] = pack
 	}
 	s := &Server{
-		artifacts:   &ArtifactStore{entries: make(map[string]Artifact)},
-		workDir:     workDir,
-		uploadsDir:  uploadsDir,
-		profilePack: profilePack,
-		concurrency: concurrency,
+		artifacts:       &ArtifactStore{entries: make(map[string]Artifact)},
+		workDir:         workDir,
+		uploadsDir:      uploadsDir,
+		profilePack:     profilePack,
+		concurrency:     concurrency,
+		updateInstaller: opts.UpdateInstaller,
+		enableAdmin:     opts.EnableAdmin,
 	}
 	return s, nil
 }
@@ -565,6 +572,71 @@ func (s *Server) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	path := filepath.Join("api", "openapi.yaml")
 	http.ServeFile(w, r, path)
+}
+
+func (s *Server) handleAdminUpdate(w http.ResponseWriter, r *http.Request) {
+	if !s.enableAdmin || s.updateInstaller == nil {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	tmpFile, err := os.CreateTemp(s.workDir, "update-*.update.zip")
+	if err != nil {
+		http.Error(w, fmt.Sprintf("temp file: %v", err), http.StatusInternalServerError)
+		return
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+	contentType := r.Header.Get("Content-Type")
+	if strings.HasPrefix(contentType, "multipart/") {
+		if err := r.ParseMultipartForm(512 << 20); err != nil {
+			http.Error(w, fmt.Sprintf("parse multipart: %v", err), http.StatusBadRequest)
+			tmpFile.Close()
+			return
+		}
+		file, _, err := r.FormFile("package")
+		if err != nil {
+			file, _, err = r.FormFile("file")
+		}
+		if err != nil {
+			http.Error(w, "package file missing", http.StatusBadRequest)
+			tmpFile.Close()
+			return
+		}
+		if _, err := io.Copy(tmpFile, file); err != nil {
+			file.Close()
+			tmpFile.Close()
+			http.Error(w, fmt.Sprintf("write temp: %v", err), http.StatusInternalServerError)
+			return
+		}
+		file.Close()
+	} else {
+		if _, err := io.Copy(tmpFile, r.Body); err != nil {
+			tmpFile.Close()
+			http.Error(w, fmt.Sprintf("write temp: %v", err), http.StatusInternalServerError)
+			return
+		}
+	}
+	if err := tmpFile.Close(); err != nil {
+		http.Error(w, fmt.Sprintf("close temp: %v", err), http.StatusInternalServerError)
+		return
+	}
+	result, err := s.updateInstaller.InstallFromArchive(tmpPath)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("install update: %v", err), http.StatusBadRequest)
+		return
+	}
+	resp := struct {
+		Version         string `json:"version"`
+		PreviousVersion string `json:"previousVersion,omitempty"`
+	}{
+		Version:         result.Version,
+		PreviousVersion: result.PreviousVersion,
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) loadRulePack(profile string, override *rules.RulePack) (rules.RulePack, error) {

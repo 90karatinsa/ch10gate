@@ -19,6 +19,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"example.com/ch10gate/internal/server"
+	"example.com/ch10gate/internal/update"
 )
 
 type logConfig struct {
@@ -102,6 +103,7 @@ func main() {
 	addr := flag.String("addr", "", "listen address (overrides config port)")
 	readTimeout := flag.Duration("read-timeout", 60*time.Second, "HTTP read timeout")
 	writeTimeout := flag.Duration("write-timeout", 60*time.Second, "HTTP write timeout")
+	enableAdmin := flag.Bool("enable-admin", false, "enable administrative endpoints")
 	flag.Parse()
 
 	cfg, err := loadConfig(*configPath)
@@ -123,12 +125,21 @@ func main() {
 	if *addr != "" {
 		listenAddr = *addr
 	}
+	var updater *update.Installer
+	if *enableAdmin {
+		updater, err = update.NewInstaller(update.Options{})
+		if err != nil {
+			log.Fatalf("update init: %v", err)
+		}
+	}
 	srv, err := server.NewServer(server.Options{
 		StorageDir: cfg.StorageDir,
 		ProfilePacks: map[string]string{
 			cfg.DefaultProfile: cfg.DefaultRulePack,
 		},
-		Concurrency: cfg.Concurrency,
+		Concurrency:     cfg.Concurrency,
+		EnableAdmin:     *enableAdmin,
+		UpdateInstaller: updater,
 	})
 	if err != nil {
 		log.Fatalf("server init: %v", err)

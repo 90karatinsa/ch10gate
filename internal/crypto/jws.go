@@ -26,6 +26,18 @@ type JWS struct {
 	Signature string `json:"signature"`
 }
 
+// ParseDetachedJWS decodes a detached JWS JSON document.
+func ParseDetachedJWS(data []byte) (JWS, error) {
+	var jws JWS
+	if err := json.Unmarshal(data, &jws); err != nil {
+		return JWS{}, err
+	}
+	if jws.Protected == "" || jws.Payload == "" || jws.Signature == "" {
+		return JWS{}, errors.New("jws missing required fields")
+	}
+	return jws, nil
+}
+
 func SignDetachedJWS(payload []byte, privateKeyPEM []byte) (JWS, error) {
 	hdr := map[string]any{
 		"alg": "RS256",

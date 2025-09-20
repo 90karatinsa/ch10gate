@@ -24,6 +24,7 @@ import (
 	"example.com/ch10gate/internal/report"
 	"example.com/ch10gate/internal/rules"
 	"example.com/ch10gate/internal/tmats"
+	"example.com/ch10gate/internal/update"
 )
 
 var (
@@ -59,6 +60,8 @@ func main() {
 		undoCmd(os.Args[2:])
 	case "rulepack":
 		rulepackCmd(os.Args[2:])
+	case "update":
+		updateCmd(os.Args[2:])
 	default:
 		usage()
 	}
@@ -76,6 +79,7 @@ Commands:
   batch     --in <dir> --profile <profile> --rules <rulepack.json> --out-dir <dir>
   undo      --in <file.fixed.ch10> --audit <audit.jsonl> --out <restored.ch10>
   rulepack  <install|list|remove|verify|set-default> [...]
+  update    --from <dir> [--install-root <dir> --bin-dir <dir> --cert <file>]
 `, version, buildDate)
 }
 
@@ -657,6 +661,47 @@ func verifySignatureCmd(args []string) {
 		os.Exit(1)
 	}
 	fmt.Println("Signature OK")
+}
+
+func updateCmd(args []string) {
+	fs := flag.NewFlagSet("update", flag.ExitOnError)
+	fromDir := fs.String("from", "", "directory containing .update.zip")
+	installRoot := fs.String("install-root", update.DefaultInstallRoot, "installation root directory")
+	binDir := fs.String("bin-dir", update.DefaultBinDir, "directory for binary symlinks")
+	certPath := fs.String("cert", update.DefaultCertPath, "trusted signer certificate (PEM)")
+	fs.Parse(args)
+
+	if *fromDir == "" {
+		fmt.Println("required: --from")
+		os.Exit(1)
+	}
+
+	archivePath, err := update.FindArchive(*fromDir)
+	if err != nil {
+		fmt.Println("locate update:", err)
+		os.Exit(1)
+	}
+
+	installer, err := update.NewInstaller(update.Options{
+		InstallRoot: *installRoot,
+		BinDir:      *binDir,
+		CertPath:    *certPath,
+	})
+	if err != nil {
+		fmt.Println("initialise installer:", err)
+		os.Exit(1)
+	}
+
+	result, err := installer.InstallFromArchive(archivePath)
+	if err != nil {
+		fmt.Println("install update:", err)
+		os.Exit(1)
+	}
+	if result.PreviousVersion != "" {
+		fmt.Printf("Updated %s -> %s\n", result.PreviousVersion, result.Version)
+	} else {
+		fmt.Printf("Installed version %s\n", result.Version)
+	}
 }
 
 func batchCmd(args []string) {
