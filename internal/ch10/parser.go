@@ -32,17 +32,9 @@ var (
 	ErrUnsupportedTimeFormat = errors.New("unsupported secondary header time format")
 )
 
-func ParsePrimaryHeader(r io.ReaderAt, offset int64) (PacketHeader, error) {
+func ParsePrimaryHeader(buf []byte) (PacketHeader, error) {
 	var hdr PacketHeader
-	buf := make([]byte, primaryHeaderSize)
-	n, err := r.ReadAt(buf, offset)
-	if err != nil {
-		if errors.Is(err, io.EOF) && n < primaryHeaderSize {
-			return hdr, io.ErrUnexpectedEOF
-		}
-		return hdr, err
-	}
-	if n < primaryHeaderSize {
+	if len(buf) < primaryHeaderSize {
 		return hdr, io.ErrUnexpectedEOF
 	}
 	hdr.Sync = binary.BigEndian.Uint16(buf[0:2])
@@ -62,6 +54,174 @@ func parseSecHdrFlags(hdr *PacketHeader) (bool, uint8) {
 	has := hdr.Flags&packetFlagSecondaryHdr != 0
 	tf := hdr.Flags & packetFlagTimeFormatMask
 	return has, tf
+}
+
+const (
+	minDataBlockSize = 8 << 20
+)
+
+type dataSource interface {
+	Size() int64
+	Slice(offset int64, length int) ([]byte, error)
+	ReadAt(p []byte, offset int64) (int, error)
+	Close() error
+}
+
+type blockSource struct {
+	file      *os.File
+	size      int64
+	blockSize int
+	buf       []byte
+	bufStart  int64
+	bufLen    int
+}
+
+func newBlockSource(f *os.File, size int64, blockSize int) *blockSource {
+	if blockSize < minDataBlockSize {
+		blockSize = minDataBlockSize
+	}
+	return &blockSource{file: f, size: size, blockSize: blockSize}
+}
+
+func (bs *blockSource) Size() int64 {
+	return bs.size
+}
+
+func (bs *blockSource) Close() error {
+	if bs.file == nil {
+		return nil
+	}
+	err := bs.file.Close()
+	bs.file = nil
+	bs.buf = nil
+	bs.bufLen = 0
+	return err
+}
+
+func (bs *blockSource) grow(need int) {
+	if need <= bs.blockSize {
+		return
+	}
+	newSize := bs.blockSize
+	if newSize == 0 {
+		newSize = minDataBlockSize
+	}
+	for newSize < need {
+		newSize *= 2
+	}
+	bs.blockSize = newSize
+	bs.buf = make([]byte, bs.blockSize)
+	bs.bufLen = 0
+	bs.bufStart = 0
+}
+
+func (bs *blockSource) ensure(offset int64, length int) error {
+	if bs.file == nil {
+		return io.EOF
+	}
+	if length > bs.blockSize {
+		bs.grow(length)
+	}
+	if bs.buf == nil {
+		bs.buf = make([]byte, bs.blockSize)
+	}
+	if offset >= bs.bufStart && offset+int64(length) <= bs.bufStart+int64(bs.bufLen) {
+		return nil
+	}
+	if offset >= bs.size {
+		bs.bufLen = 0
+		return io.EOF
+	}
+	bs.bufStart = offset
+	remain := bs.size - offset
+	if remain < 0 {
+		remain = 0
+	}
+	toRead := bs.blockSize
+	if int64(toRead) > remain {
+		toRead = int(remain)
+	}
+	if toRead <= 0 {
+		bs.bufLen = 0
+		return io.EOF
+	}
+	if len(bs.buf) < toRead {
+		bs.buf = make([]byte, toRead)
+	}
+	n, err := bs.file.ReadAt(bs.buf[:toRead], offset)
+	if n < toRead && err == nil {
+		err = io.EOF
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		bs.bufLen = 0
+		return err
+	}
+	bs.bufLen = n
+	if bs.bufLen == 0 {
+		return io.EOF
+	}
+	return err
+}
+
+func (bs *blockSource) Slice(offset int64, length int) ([]byte, error) {
+	if length <= 0 {
+		return []byte{}, nil
+	}
+	if offset < 0 {
+		return nil, io.ErrUnexpectedEOF
+	}
+	if offset >= bs.size {
+		return nil, io.EOF
+	}
+	err := bs.ensure(offset, length)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	if bs.bufLen == 0 {
+		return nil, io.EOF
+	}
+	start := int(offset - bs.bufStart)
+	if start < 0 || start >= bs.bufLen {
+		return nil, io.ErrUnexpectedEOF
+	}
+	end := start + length
+	if end > bs.bufLen {
+		end = bs.bufLen
+	}
+	view := bs.buf[start:end]
+	if len(view) < length {
+		return view, io.EOF
+	}
+	return view, err
+}
+
+func (bs *blockSource) ReadAt(p []byte, offset int64) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	view, err := bs.Slice(offset, len(p))
+	n := copy(p, view)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return n, err
+	}
+	if n < len(p) {
+		return n, io.EOF
+	}
+	if err == io.EOF {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func sliceExact(src dataSource, offset int64, length int) ([]byte, error) {
+	view, err := src.Slice(offset, length)
+	if len(view) < length {
+		if err != nil && !errors.Is(err, io.EOF) {
+			return nil, err
+		}
+		return nil, io.ErrUnexpectedEOF
+	}
+	return view[:length], nil
 }
 
 const (
@@ -170,11 +330,13 @@ func decodeIPTSToMicros(tf uint8, raw []byte) (int64, SecondaryHeader, error) {
 // Reader iterates across a Chapter 10 file sequentially while building an index
 // of packet metadata.
 type Reader struct {
-	file         *os.File
+	source       dataSource
 	size         int64
 	offset       int64
 	resyncWindow int64
 	resyncBuf    []byte
+
+	metrics *common.Metrics
 
 	primary    PacketHeader
 	primarySet bool
@@ -197,9 +359,10 @@ func NewReader(path string) (*Reader, error) {
 		f.Close()
 		return nil, err
 	}
+	src := newBlockSource(f, info.Size(), minDataBlockSize)
 	return &Reader{
-		file:                  f,
-		size:                  info.Size(),
+		source:                src,
+		size:                  src.Size(),
 		resyncWindow:          defaultResyncWindow,
 		resyncBuf:             make([]byte, defaultResyncWindow),
 		lastTimeRefUs:         -1,
@@ -212,12 +375,20 @@ func NewReader(path string) (*Reader, error) {
 
 // Close releases the underlying file handle.
 func (r *Reader) Close() error {
-	if r.file == nil {
+	if r.source == nil {
 		return nil
 	}
-	err := r.file.Close()
-	r.file = nil
+	err := r.source.Close()
+	r.source = nil
 	return err
+}
+
+// SetMetrics attaches a metrics recorder to the reader.
+func (r *Reader) SetMetrics(m *common.Metrics) {
+	r.metrics = m
+	if r.metrics != nil {
+		r.metrics.SetTotalBytes(r.size)
+	}
 }
 
 // PrimaryHeader returns the first successfully parsed packet header.
@@ -242,7 +413,7 @@ func (r *Reader) Index() FileIndex {
 // Next advances to the next packet header. It returns io.EOF when the end of
 // the file is reached.
 func (r *Reader) Next() (PacketHeader, PacketIndex, error) {
-	if r.file == nil {
+	if r.source == nil {
 		return PacketHeader{}, PacketIndex{}, io.EOF
 	}
 	for {
@@ -252,11 +423,15 @@ func (r *Reader) Next() (PacketHeader, PacketIndex, error) {
 			}
 			return PacketHeader{}, PacketIndex{}, io.ErrUnexpectedEOF
 		}
-		hdr, err := ParsePrimaryHeader(r.file, r.offset)
-		if err != nil {
-			if errors.Is(err, io.ErrUnexpectedEOF) {
+		headerView, err := r.source.Slice(r.offset, primaryHeaderSize)
+		if len(headerView) < primaryHeaderSize {
+			if err != nil && !errors.Is(err, io.EOF) {
 				return PacketHeader{}, PacketIndex{}, err
 			}
+			return PacketHeader{}, PacketIndex{}, io.ErrUnexpectedEOF
+		}
+		hdr, err := ParsePrimaryHeader(headerView)
+		if err != nil {
 			return PacketHeader{}, PacketIndex{}, err
 		}
 		if hdr.Sync != syncPattern {
@@ -307,8 +482,7 @@ func (r *Reader) Next() (PacketHeader, PacketIndex, error) {
 		if hasSecHdr {
 			if secOffset+secondaryHeaderSize <= nextOffset && secOffset+secondaryHeaderSize <= r.size {
 				idx.SecHdrBytes = true
-				buf := make([]byte, secondaryTimeFieldLen)
-				if _, err := r.file.ReadAt(buf, secOffset); err == nil {
+				if buf, err := sliceExact(r.source, secOffset, secondaryTimeFieldLen); err == nil {
 					ts, secondary, err := decodeIPTSToMicros(timeFmt, buf)
 					if err != nil {
 						if errors.Is(err, ErrUnsupportedTimeFormat) {
@@ -352,7 +526,7 @@ func (r *Reader) Next() (PacketHeader, PacketIndex, error) {
 		}
 
 		if hdr.DataType == 0x18 || hdr.DataType == 0x19 {
-			info, err := parseMIL1553Payload(r.file, payloadOffset, payloadLen, hdr.DataType)
+			info, err := parseMIL1553Payload(r.source, payloadOffset, payloadLen, hdr.DataType)
 			if err != nil {
 				common.Logf("1553 parse error at offset %d: %v", r.offset, err)
 			} else if info != nil {
@@ -362,7 +536,7 @@ func (r *Reader) Next() (PacketHeader, PacketIndex, error) {
 				idx.MIL1553 = info
 			}
 		} else if hdr.DataType == 0x08 {
-			info, err := parsePCMPayload(r.file, payloadOffset, payloadLen)
+			info, err := parsePCMPayload(r.source, payloadOffset, payloadLen)
 			if err != nil {
 				common.Logf("PCM parse error at offset %d: %v", r.offset, err)
 			} else if info != nil {
@@ -372,7 +546,7 @@ func (r *Reader) Next() (PacketHeader, PacketIndex, error) {
 				idx.PCM = info
 			}
 		} else if hdr.DataType == 0x38 {
-			info, err := parseA429Payload(r.file, payloadOffset, payloadLen)
+			info, err := parseA429Payload(r.source, payloadOffset, payloadLen)
 			if err != nil {
 				common.Logf("ARINC-429 parse error at offset %d: %v", r.offset, err)
 			} else if info != nil {
@@ -386,8 +560,7 @@ func (r *Reader) Next() (PacketHeader, PacketIndex, error) {
 		if isTime {
 			r.index.HasTimePacket = true
 			if idx.TimeStampUs < 0 && payloadLen >= int64(secondaryTimeFieldLen) {
-				buf := make([]byte, secondaryTimeFieldLen)
-				if _, err := r.file.ReadAt(buf, payloadOffset); err == nil {
+				if buf, err := sliceExact(r.source, payloadOffset, secondaryTimeFieldLen); err == nil {
 					ts, _, err := decodeIPTSToMicros(timeFmt, buf)
 					if err == nil {
 						idx.TimeStampUs = ts
@@ -407,8 +580,7 @@ func (r *Reader) Next() (PacketHeader, PacketIndex, error) {
 				}
 			}
 			if idx.TimeStampUs < 0 && payloadLen >= int64(secondaryTimeFieldLen) {
-				buf := make([]byte, secondaryTimeFieldLen)
-				if _, err := r.file.ReadAt(buf, payloadOffset); err == nil {
+				if buf, err := sliceExact(r.source, payloadOffset, secondaryTimeFieldLen); err == nil {
 					ipts := int64(binary.BigEndian.Uint64(buf))
 					if r.lastTimeRefUs >= 0 {
 						idx.TimeStampUs = r.lastTimeRefUs + ipts
@@ -426,8 +598,11 @@ func (r *Reader) Next() (PacketHeader, PacketIndex, error) {
 		}
 
 		r.index.TimeSeenBeforeDynamic = r.timeSeenBeforeDynamic
-
 		r.index.Packets = append(r.index.Packets, idx)
+
+		if r.metrics != nil {
+			r.metrics.AddPacket(totalLen)
+		}
 
 		r.offset = nextOffset
 		return hdr, idx, nil
@@ -436,9 +611,16 @@ func (r *Reader) Next() (PacketHeader, PacketIndex, error) {
 
 func (r *Reader) resync(reason string) error {
 	common.Logf("resync at offset %d: %s", r.offset, reason)
+	if r.metrics != nil {
+		r.metrics.IncResync()
+	}
+	origOffset := r.offset
 	start := r.offset + 1
 	if start >= r.size {
 		r.offset = r.size
+		if r.metrics != nil && r.offset > origOffset {
+			r.metrics.AddBytes(r.offset - origOffset)
+		}
 		return io.EOF
 	}
 	limit := start + r.resyncWindow
@@ -448,16 +630,22 @@ func (r *Reader) resync(reason string) error {
 	window := limit - start
 	if window < 2 {
 		r.offset = limit
+		if r.metrics != nil && r.offset > origOffset {
+			r.metrics.AddBytes(r.offset - origOffset)
+		}
 		return io.EOF
 	}
 	if int64(len(r.resyncBuf)) < window {
 		r.resyncBuf = make([]byte, window)
 	}
 	buf := r.resyncBuf[:window]
-	n, err := r.file.ReadAt(buf, start)
+	n, err := r.source.ReadAt(buf, start)
 	if n < 2 && err != nil {
 		if errors.Is(err, io.EOF) {
 			r.offset = r.size
+			if r.metrics != nil && r.offset > origOffset {
+				r.metrics.AddBytes(r.offset - origOffset)
+			}
 			return io.EOF
 		}
 		return err
@@ -465,11 +653,17 @@ func (r *Reader) resync(reason string) error {
 	for i := 0; i < n-1; i++ {
 		if buf[i] == 0xEB && buf[i+1] == 0x25 {
 			r.offset = start + int64(i)
+			if r.metrics != nil && r.offset > origOffset {
+				r.metrics.AddBytes(r.offset - origOffset)
+			}
 			common.Logf("resync successful, new offset %d", r.offset)
 			return nil
 		}
 	}
 	r.offset = limit
+	if r.metrics != nil && r.offset > origOffset {
+		r.metrics.AddBytes(r.offset - origOffset)
+	}
 	if limit >= r.size || errors.Is(err, io.EOF) {
 		return io.EOF
 	}
@@ -505,7 +699,7 @@ func ScanFileMin(path string) (PacketHeader, FileIndex, error) {
 	return hdr, idx, nil
 }
 
-func parsePCMPayload(r io.ReaderAt, offset int64, payloadLen int64) (*PCMInfo, error) {
+func parsePCMPayload(src dataSource, offset int64, payloadLen int64) (*PCMInfo, error) {
 	info := &PCMInfo{}
 	if payloadLen <= 0 {
 		info.ParseError = "payload empty"
@@ -515,21 +709,20 @@ func parsePCMPayload(r io.ReaderAt, offset int64, payloadLen int64) (*PCMInfo, e
 		info.ParseError = "payload shorter than CSDW"
 		return info, nil
 	}
-	var csdwBuf [4]byte
-	n, err := r.ReadAt(csdwBuf[:], offset)
-	if err != nil && !errors.Is(err, io.EOF) {
+	buf, err := sliceExact(src, offset, 4)
+	if err != nil {
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			info.ParseError = "payload shorter than CSDW"
+			return info, nil
+		}
 		return info, err
 	}
-	if n < 4 {
-		info.ParseError = "payload shorter than CSDW"
-		return info, nil
-	}
-	decoded := DecodePCMCSDW(binary.BigEndian.Uint32(csdwBuf[:]))
+	decoded := DecodePCMCSDW(binary.BigEndian.Uint32(buf))
 	*info = decoded
 	return info, nil
 }
 
-func parseMIL1553Payload(r io.ReaderAt, offset int64, payloadLen int64, dataType uint16) (*MIL1553Info, error) {
+func parseMIL1553Payload(src dataSource, offset int64, payloadLen int64, dataType uint16) (*MIL1553Info, error) {
 	var format uint8
 	switch dataType {
 	case 0x18:
@@ -550,16 +743,15 @@ func parseMIL1553Payload(r io.ReaderAt, offset int64, payloadLen int64, dataType
 		return info, nil
 	}
 
-	var csdwBuf [4]byte
-	n, err := r.ReadAt(csdwBuf[:], offset)
-	if err != nil && !errors.Is(err, io.EOF) {
+	buf, err := sliceExact(src, offset, 4)
+	if err != nil {
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			info.ParseError = "payload shorter than CSDW"
+			return info, nil
+		}
 		return info, err
 	}
-	if n < 4 {
-		info.ParseError = "payload shorter than CSDW"
-		return info, nil
-	}
-	info.CSDW = binary.BigEndian.Uint32(csdwBuf[:])
+	info.CSDW = binary.BigEndian.Uint32(buf)
 	cursor := offset + 4
 	end := offset + payloadLen
 
@@ -576,16 +768,15 @@ func parseMIL1553Payload(r io.ReaderAt, offset int64, payloadLen int64, dataType
 			info.ParseError = fmt.Sprintf("message %d missing IPTS", msgIdx+1)
 			break
 		}
-		var iptsBuf [8]byte
-		n, err = r.ReadAt(iptsBuf[:], cursor)
-		if err != nil && !errors.Is(err, io.EOF) {
+		iptsBuf, err := sliceExact(src, cursor, 8)
+		if err != nil {
+			if errors.Is(err, io.ErrUnexpectedEOF) {
+				info.ParseError = fmt.Sprintf("message %d IPTS truncated", msgIdx+1)
+				break
+			}
 			return info, err
 		}
-		if n < 8 {
-			info.ParseError = fmt.Sprintf("message %d IPTS truncated", msgIdx+1)
-			break
-		}
-		msg := MIL1553Message{IPTS: binary.BigEndian.Uint64(iptsBuf[:])}
+		msg := MIL1553Message{IPTS: binary.BigEndian.Uint64(iptsBuf)}
 		cursor += 8
 
 		switch format {
@@ -594,14 +785,13 @@ func parseMIL1553Payload(r io.ReaderAt, offset int64, payloadLen int64, dataType
 				info.ParseError = fmt.Sprintf("message %d missing IPDH", msgIdx+1)
 				return info, nil
 			}
-			var ipdhBuf [6]byte
-			n, err = r.ReadAt(ipdhBuf[:], cursor)
-			if err != nil && !errors.Is(err, io.EOF) {
+			ipdhBuf, err := sliceExact(src, cursor, 6)
+			if err != nil {
+				if errors.Is(err, io.ErrUnexpectedEOF) {
+					info.ParseError = fmt.Sprintf("message %d IPDH truncated", msgIdx+1)
+					return info, nil
+				}
 				return info, err
-			}
-			if n < 6 {
-				info.ParseError = fmt.Sprintf("message %d IPDH truncated", msgIdx+1)
-				return info, nil
 			}
 			msg.BlockStatusWord = binary.BigEndian.Uint16(ipdhBuf[0:2])
 			msg.GapTimeWord = binary.BigEndian.Uint16(ipdhBuf[2:4])
@@ -623,14 +813,13 @@ func parseMIL1553Payload(r io.ReaderAt, offset int64, payloadLen int64, dataType
 				info.ParseError = fmt.Sprintf("message %d missing IPDH", msgIdx+1)
 				return info, nil
 			}
-			var ipdhBuf [4]byte
-			n, err = r.ReadAt(ipdhBuf[:], cursor)
-			if err != nil && !errors.Is(err, io.EOF) {
+			ipdhBuf, err := sliceExact(src, cursor, 4)
+			if err != nil {
+				if errors.Is(err, io.ErrUnexpectedEOF) {
+					info.ParseError = fmt.Sprintf("message %d IPDH truncated", msgIdx+1)
+					return info, nil
+				}
 				return info, err
-			}
-			if n < 4 {
-				info.ParseError = fmt.Sprintf("message %d IPDH truncated", msgIdx+1)
-				return info, nil
 			}
 			msg.IPDHStatus = binary.BigEndian.Uint16(ipdhBuf[0:2])
 			msg.IPDHLength = binary.BigEndian.Uint16(ipdhBuf[2:4])
@@ -655,7 +844,7 @@ func parseMIL1553Payload(r io.ReaderAt, offset int64, payloadLen int64, dataType
 	return info, nil
 }
 
-func parseA429Payload(r io.ReaderAt, offset int64, payloadLen int64) (*A429Info, error) {
+func parseA429Payload(src dataSource, offset int64, payloadLen int64) (*A429Info, error) {
 	info := &A429Info{}
 	if payloadLen <= 0 {
 		info.ParseError = "payload empty"
@@ -666,16 +855,15 @@ func parseA429Payload(r io.ReaderAt, offset int64, payloadLen int64) (*A429Info,
 		return info, nil
 	}
 
-	var csdwBuf [4]byte
-	n, err := r.ReadAt(csdwBuf[:], offset)
-	if err != nil && !errors.Is(err, io.EOF) {
+	buf, err := sliceExact(src, offset, 4)
+	if err != nil {
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			info.ParseError = "payload shorter than CSDW"
+			return info, nil
+		}
 		return info, err
 	}
-	if n < 4 {
-		info.ParseError = "payload shorter than CSDW"
-		return info, nil
-	}
-	info.CSDW = binary.BigEndian.Uint32(csdwBuf[:])
+	info.CSDW = binary.BigEndian.Uint32(buf)
 	info.MessageCount = uint32(info.CSDW & 0x0000FFFF)
 	cursor := offset + 4
 	end := offset + payloadLen
@@ -690,19 +878,18 @@ func parseA429Payload(r io.ReaderAt, offset int64, payloadLen int64) (*A429Info,
 	}
 
 	info.Words = make([]A429Word, 0, info.MessageCount)
-	var pairBuf [8]byte
 	for wordIdx := uint32(0); wordIdx < info.MessageCount; wordIdx++ {
 		if cursor+8 > end {
 			info.ParseError = fmt.Sprintf("word %d truncated", wordIdx+1)
 			return info, nil
 		}
-		n, err = r.ReadAt(pairBuf[:], cursor)
-		if err != nil && !errors.Is(err, io.EOF) {
+		pairBuf, err := sliceExact(src, cursor, 8)
+		if err != nil {
+			if errors.Is(err, io.ErrUnexpectedEOF) {
+				info.ParseError = fmt.Sprintf("word %d truncated", wordIdx+1)
+				return info, nil
+			}
 			return info, err
-		}
-		if n < 8 {
-			info.ParseError = fmt.Sprintf("word %d truncated", wordIdx+1)
-			return info, nil
 		}
 		idWord := binary.BigEndian.Uint32(pairBuf[0:4])
 		dataWord := binary.BigEndian.Uint32(pairBuf[4:8])
