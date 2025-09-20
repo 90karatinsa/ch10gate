@@ -23,9 +23,12 @@ schemas, service definitions, docs, and sample data:
 Environment knobs:
 
 * `VERSION` — override the git tag/hash embedded in the CLI binaries.
-* `GATE_BUNDLE_SIGNING_KEY` — shared secret for signing `SIGNATURE.jws`
-  (default: `ch10gate-demo-secret`).
-* `GATE_BUNDLE_KEY_ID` — identifier placed in the JWS header (default: `demo`).
+* `GATE_BUNDLE_SIGNING_KEY` — path to the RSA private key used for manifest
+  signatures (default:
+  `config/dev/bundle_signing/dev_signing_key.pem`).
+* `GATE_BUNDLE_SIGNING_CERT` — path to the PEM encoded X.509 certificate that
+  corresponds to the signing key (default:
+  `config/dev/bundle_signing/dev_signing_cert.pem`).
 
 Artifacts land in `DIST/ch10gate_bundle/`. Distribute that directory as-is for
 offline QA installations.
