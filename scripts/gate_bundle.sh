@@ -22,8 +22,33 @@ VERSION="${VERSION:-$(git -C "${ROOT_DIR}" describe --tags --always --dirty 2>/d
 BUILD_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 REVISION="$(git -C "${ROOT_DIR}" rev-parse HEAD 2>/dev/null || echo unknown)"
 
-SIGNING_SECRET="${GATE_BUNDLE_SIGNING_KEY:-ch10gate-demo-secret}"
-SIGNING_KEY_ID="${GATE_BUNDLE_KEY_ID:-demo}"
+DEFAULT_SIGNING_KEY="${ROOT_DIR}/config/dev/bundle_signing/dev_signing_key.pem"
+DEFAULT_SIGNING_CERT="${ROOT_DIR}/config/dev/bundle_signing/dev_signing_cert.pem"
+
+SIGNING_KEY_PATH="${GATE_BUNDLE_SIGNING_KEY:-${DEFAULT_SIGNING_KEY}}"
+SIGNING_CERT_PATH="${GATE_BUNDLE_SIGNING_CERT:-${DEFAULT_SIGNING_CERT}}"
+
+if [ ! -f "${SIGNING_KEY_PATH}" ]; then
+  echo "fatal: signing key not found at ${SIGNING_KEY_PATH}" >&2
+  exit 1
+fi
+
+if [ ! -f "${SIGNING_CERT_PATH}" ]; then
+  echo "fatal: signing certificate not found at ${SIGNING_CERT_PATH}" >&2
+  exit 1
+fi
+
+abs_path() {
+  python3 - "$1" <<'PY'
+import os
+import sys
+
+print(os.path.abspath(sys.argv[1]))
+PY
+}
+
+SIGNING_KEY_ABS="$(abs_path "${SIGNING_KEY_PATH}")"
+SIGNING_CERT_ABS="$(abs_path "${SIGNING_CERT_PATH}")"
 
 mkdir -p "${DIST_DIR}"
 rm -rf "${BUNDLE_DIR}"
@@ -54,7 +79,7 @@ cp "${ROOT_DIR}/examples/sample.ch10" "${EXAMPLES_DIR}/sample.ch10"
 cp "${ROOT_DIR}/examples/README.txt" "${EXAMPLES_DIR}/README.txt"
 cp "${ROOT_DIR}/examples/dicts/"*.json "${EXAMPLES_DIR}/dicts/"
 
-export BUNDLE_DIR VERSION BUILD_DATE REVISION BUNDLE_NAME SIGNING_SECRET SIGNING_KEY_ID
+export BUNDLE_DIR VERSION BUILD_DATE REVISION BUNDLE_NAME
 
 echo "[gate-bundle] generating documentation PDFs"
 python3 - <<'PY'
@@ -132,63 +157,95 @@ build_pdf(
 )
 PY
 
-echo "[gate-bundle] writing manifest"
-python3 - <<'PY'
-import hashlib
-import json
-import os
-from pathlib import Path
-
-bundle_dir = Path(os.environ["BUNDLE_DIR"])
-manifest_path = bundle_dir / "manifest.json"
-files = []
-for path in sorted(bundle_dir.rglob('*')):
-    if path.is_file():
-        rel = path.relative_to(bundle_dir).as_posix()
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        info = path.stat()
-        files.append({
-            "path": rel,
-            "size": info.st_size,
-            "sha256": digest,
-        })
-manifest = {
-    "bundle": "ch10gate",
-    "name": os.environ.get("BUNDLE_NAME", "ch10gate_bundle"),
-    "version": os.environ["VERSION"],
-    "buildDate": os.environ["BUILD_DATE"],
-    "revision": os.environ.get("REVISION", "unknown"),
-    "files": files,
+TMP_LICENSE="$(mktemp)"
+cleanup_license() {
+  rm -f "${TMP_LICENSE}"
 }
-manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-PY
+trap cleanup_license EXIT
 
-echo "[gate-bundle] generating JWS signature"
-python3 - <<'PY'
-import base64
+python3 - "${TMP_LICENSE}" <<'PY'
+import datetime
 import hashlib
 import hmac
 import json
-import os
+import platform
+import socket
+import sys
 from pathlib import Path
 
-def b64url(data: bytes) -> bytes:
-    return base64.urlsafe_b64encode(data).rstrip(b'=')
+def machine_components() -> list[str]:
+    hostname = socket.gethostname().lower()
+    components = [hostname]
+    macs: list[str] = []
+    net_dir = Path('/sys/class/net')
+    if net_dir.exists():
+        for iface in net_dir.iterdir():
+            try:
+                mac = (iface / 'address').read_text().strip().lower()
+            except FileNotFoundError:
+                continue
+            if not mac or mac == '00:00:00:00:00:00':
+                continue
+            if iface.name.lower().startswith('lo'):
+                continue
+            macs.append(mac)
+    if not macs:
+        macs.append(platform.system().lower())
+    components.extend(macs)
+    return components
 
-bundle_dir = Path(os.environ["BUNDLE_DIR"])
-manifest_path = bundle_dir / "manifest.json"
-secret = os.environ["SIGNING_SECRET"].encode("utf-8")
-key_id = os.environ["SIGNING_KEY_ID"]
-manifest_hash = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-header = {"alg": "HS256", "typ": "JWS", "kid": key_id}
-payload = {"manifest_sha256": manifest_hash, "version": os.environ["VERSION"], "generated_at": os.environ["BUILD_DATE"]}
-header_b64 = b64url(json.dumps(header, separators=(',', ':')).encode('utf-8'))
-payload_b64 = b64url(json.dumps(payload, separators=(',', ':')).encode('utf-8'))
-signing_input = header_b64 + b'.' + payload_b64
-sig = hmac.new(secret, signing_input, hashlib.sha256).digest()
-jws = signing_input + b'.' + b64url(sig)
-(bundle_dir / "SIGNATURE.jws").write_bytes(jws)
+out_path = Path(sys.argv[1])
+components = machine_components()
+machine_hash = hashlib.sha256('|'.join(components).encode()).hexdigest()
+expiry = (datetime.datetime.utcnow() + datetime.timedelta(days=365)).strftime('%Y-%m-%d')
+mac = hmac.new(b'ch10gate-license-secret', digestmod=hashlib.sha256)
+mac.update(machine_hash.encode())
+mac.update(b'|')
+mac.update(expiry.encode())
+signature = mac.hexdigest()
+
+payload = {
+    'machine': machine_hash,
+    'expiry': expiry,
+    'signature': signature,
+}
+out_path.write_text(json.dumps(payload, indent=2) + '\n', encoding='utf-8')
 PY
+
+echo "[gate-bundle] writing manifest and signature"
+pushd "${BUNDLE_DIR}" >/dev/null
+MANIFEST_INPUTS="$(python3 - <<'PY'
+from pathlib import Path
+
+bundle = Path('.')
+paths = []
+for path in bundle.rglob('*'):
+    if path.is_file():
+        if path.name in {"manifest.json", "SIGNATURE.jws"}:
+            continue
+        rel = path.relative_to(bundle)
+        paths.append(rel.as_posix())
+paths.sort()
+print(','.join(paths))
+PY
+)"
+
+if [ -z "${MANIFEST_INPUTS}" ]; then
+  echo "fatal: no bundle contents found for manifest" >&2
+  exit 1
+fi
+
+CH10CTL_LICENSE_PATH="${TMP_LICENSE}" "${BIN_DIR}/ch10ctl" manifest \
+  --inputs "${MANIFEST_INPUTS}" \
+  --out manifest.json \
+  --sign \
+  --key "${SIGNING_KEY_ABS}" \
+  --cert "${SIGNING_CERT_ABS}" \
+  --jws-out SIGNATURE.jws
+popd >/dev/null
+
+trap - EXIT
+cleanup_license
 
 echo "[gate-bundle] bundle ready at ${BUNDLE_DIR}"
 echo "[gate-bundle] manifest sha256: $(sha256sum "${BUNDLE_DIR}/manifest.json" | awk '{print $1}')"
