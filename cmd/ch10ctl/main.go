@@ -1,12 +1,17 @@
 package main
 
 import (
+	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 
+	"example.com/ch10gate/internal/crypto"
 	"example.com/ch10gate/internal/manifest"
 	"example.com/ch10gate/internal/report"
 	"example.com/ch10gate/internal/rules"
@@ -27,6 +32,8 @@ func main() {
 		reportCmd(os.Args[2:])
 	case "manifest":
 		manifestCmd(os.Args[2:])
+	case "verify-signature":
+		verifySignatureCmd(os.Args[2:])
 	case "batch":
 		batchCmd(os.Args[2:])
 	default:
@@ -41,7 +48,8 @@ Commands:
   validate  --in <file> --profile <profile> --rules <rulepack.json> --tmats <file> --out <diagnostics.jsonl> --acceptance <acceptance.json>
   autofix   --in <file> --profile <profile> --rules <rulepack.json> --tmats <file>
   report    --diagnostics <diagnostics.jsonl> --acceptance <acceptance.json>
-  manifest  --inputs <comma-separated> --out <manifest.json> [--sign]
+  manifest  --inputs <comma-separated> --out <manifest.json> [--sign --key <key.pem> --cert <cert.pem> --jws-out <file>]
+  verify-signature --manifest <manifest.json> --jws <signature.jws> --cert <cert.pem>
   batch     --in <dir> --profile <profile> --rules <rulepack.json> --out-dir <dir>
 `)
 }
@@ -170,23 +178,158 @@ func manifestCmd(args []string) {
 	inputs := fs.String("inputs", "", "comma-separated paths")
 	out := fs.String("out", "manifest.json", "output json")
 	sign := fs.Bool("sign", false, "sign manifest (detached JWS over JSON)")
+	keyPath := fs.String("key", "", "PEM private key for signing (requires --sign)")
+	certPath := fs.String("cert", "", "PEM certificate describing signer (requires --sign)")
+	jwsOut := fs.String("jws-out", "", "output JWS file (defaults to manifest path with .jws)")
 	fs.Parse(args)
 
-	paths := strings.Split(*inputs, ",")
+	if *inputs == "" {
+		fmt.Println("required: --inputs")
+		os.Exit(1)
+	}
+
+	var paths []string
+	for _, p := range strings.Split(*inputs, ",") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		paths = append(paths, p)
+	}
+	if len(paths) == 0 {
+		fmt.Println("no input paths specified")
+		os.Exit(1)
+	}
+
 	m, err := manifest.Build(paths)
 	if err != nil {
 		fmt.Println("manifest build:", err)
 		os.Exit(1)
 	}
 
-	// Signing placeholder: left as future step using internal/crypto
-	_ = sign
+	if !*sign {
+		if err := manifest.Save(m, *out); err != nil {
+			fmt.Println("manifest save:", err)
+			os.Exit(1)
+		}
+		fmt.Println("Wrote", *out)
+		return
+	}
 
-	if err := manifest.Save(m, *out); err != nil {
-		fmt.Println("manifest save:", err)
+	if *keyPath == "" || *certPath == "" {
+		fmt.Println("--sign requires --key and --cert")
 		os.Exit(1)
 	}
+
+	keyBytes, err := os.ReadFile(*keyPath)
+	if err != nil {
+		fmt.Println("read key:", err)
+		os.Exit(1)
+	}
+	certBytes, err := os.ReadFile(*certPath)
+	if err != nil {
+		fmt.Println("read cert:", err)
+		os.Exit(1)
+	}
+
+	sigPath := *jwsOut
+	if sigPath == "" {
+		base := *out
+		ext := filepath.Ext(base)
+		if ext != "" {
+			sigPath = base[:len(base)-len(ext)] + ".jws"
+		} else {
+			sigPath = base + ".jws"
+		}
+	}
+
+	block, _ := pem.Decode(certBytes)
+	if block == nil {
+		fmt.Println("parse cert: no PEM block found")
+		os.Exit(1)
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		fmt.Println("parse cert:", err)
+		os.Exit(1)
+	}
+
+	m.Signature = &manifest.Signature{
+		Type:          "jws-detached",
+		CertSubject:   cert.Subject.String(),
+		Issuer:        cert.Issuer.String(),
+		SignatureFile: sigPath,
+	}
+
+	payload, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		fmt.Println("manifest marshal:", err)
+		os.Exit(1)
+	}
+
+	jws, err := crypto.SignDetachedJWS(payload, keyBytes)
+	if err != nil {
+		fmt.Println("manifest sign:", err)
+		os.Exit(1)
+	}
+	jwsBytes, err := json.MarshalIndent(jws, "", "  ")
+	if err != nil {
+		fmt.Println("jws marshal:", err)
+		os.Exit(1)
+	}
+
+	if err := os.WriteFile(sigPath, jwsBytes, 0644); err != nil {
+		fmt.Println("write jws:", err)
+		os.Exit(1)
+	}
+	if err := os.WriteFile(*out, payload, 0644); err != nil {
+		fmt.Println("write manifest:", err)
+		os.Exit(1)
+	}
+
 	fmt.Println("Wrote", *out)
+	fmt.Println("Wrote signature", sigPath)
+}
+
+func verifySignatureCmd(args []string) {
+	fs := flag.NewFlagSet("verify-signature", flag.ExitOnError)
+	manifestPath := fs.String("manifest", "", "manifest JSON file")
+	jwsPath := fs.String("jws", "", "manifest JWS signature file")
+	certPath := fs.String("cert", "", "signer certificate (PEM)")
+	fs.Parse(args)
+
+	if *manifestPath == "" || *jwsPath == "" || *certPath == "" {
+		fmt.Println("required: --manifest, --jws, --cert")
+		os.Exit(1)
+	}
+
+	manifestBytes, err := os.ReadFile(*manifestPath)
+	if err != nil {
+		fmt.Println("read manifest:", err)
+		os.Exit(1)
+	}
+	jwsBytes, err := os.ReadFile(*jwsPath)
+	if err != nil {
+		fmt.Println("read jws:", err)
+		os.Exit(1)
+	}
+	certBytes, err := os.ReadFile(*certPath)
+	if err != nil {
+		fmt.Println("read cert:", err)
+		os.Exit(1)
+	}
+
+	var jwsObj crypto.JWS
+	if err := json.Unmarshal(jwsBytes, &jwsObj); err != nil {
+		fmt.Println("parse jws:", err)
+		os.Exit(1)
+	}
+
+	if err := crypto.VerifyDetachedJWS(manifestBytes, jwsObj, certBytes); err != nil {
+		fmt.Println("verify signature:", err)
+		os.Exit(1)
+	}
+	fmt.Println("Signature OK")
 }
 
 func batchCmd(args []string) {
