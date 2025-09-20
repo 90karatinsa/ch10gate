@@ -1,2 +1,3 @@
 DIST/
 examples/sample.ch10
+config/dev/bundle_signing/*.pem
