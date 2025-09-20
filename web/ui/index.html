@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ch10d Validation Console</title>
+    <link rel="stylesheet" href="app.css">
+</head>
+<body>
+    <header class="app-header">
+        <h1>ch10d Validation Console</h1>
+        <p class="subtitle">Offline workflow for uploading data, selecting a profile, and running validation or auto-fix with live diagnostics.</p>
+    </header>
+
+    <main class="layout">
+        <section class="panel uploads" aria-labelledby="uploads-heading">
+            <h2 id="uploads-heading">1. Upload Inputs</h2>
+            <div id="drop-zone" class="drop-zone" tabindex="0" role="button" aria-label="Drop files here or activate to browse">
+                <p>Drop files here or <span class="accent">browse</span></p>
+                <input id="file-input" class="sr-only" type="file" multiple>
+            </div>
+            <p class="hint">Accepted inputs include Chapter 10 captures, TMATS, or other supporting files. Files remain on this machine.</p>
+            <div class="uploaded-summary" aria-live="polite">
+                <h3>Uploaded Files</h3>
+                <ul id="uploaded-files" class="file-list empty">
+                    <li>No files uploaded yet.</li>
+                </ul>
+            </div>
+        </section>
+
+        <section class="panel configuration" aria-labelledby="config-heading">
+            <h2 id="config-heading">2. Configure Run</h2>
+            <div class="field-group">
+                <label for="profile-select">Profile</label>
+                <select id="profile-select" required>
+                    <option value="" disabled selected>Loading profiles…</option>
+                </select>
+            </div>
+            <div class="field-group">
+                <label for="input-select">Primary Input</label>
+                <select id="input-select">
+                    <option value="" disabled selected>No uploads yet</option>
+                </select>
+            </div>
+            <div class="field-group">
+                <label for="tmats-select">TMATS (optional)</label>
+                <select id="tmats-select">
+                    <option value="">None</option>
+                </select>
+            </div>
+            <div class="field-group">
+                <label for="rulepack-input">Rule Pack Override (JSON)</label>
+                <input id="rulepack-input" type="file" accept="application/json">
+                <p id="rulepack-status" class="status-text" aria-live="polite">Using default rule pack.</p>
+            </div>
+            <div class="actions">
+                <button id="start-validate" type="button" class="primary">Start Validate</button>
+                <button id="start-autofix" type="button">Start Auto-Fix</button>
+            </div>
+            <p id="run-status" class="status-text" aria-live="polite"></p>
+        </section>
+
+        <section class="panel diagnostics" aria-labelledby="diagnostics-heading">
+            <div class="panel-header">
+                <h2 id="diagnostics-heading">3. Live Diagnostics</h2>
+                <button id="clear-diagnostics" type="button" class="secondary">Clear</button>
+            </div>
+            <div class="table-wrapper" role="region" aria-live="polite">
+                <table class="diagnostic-table">
+                    <thead>
+                        <tr>
+                            <th scope="col">Severity</th>
+                            <th scope="col">Rule</th>
+                            <th scope="col">Message</th>
+                            <th scope="col">File</th>
+                            <th scope="col">Timestamp</th>
+                        </tr>
+                    </thead>
+                    <tbody id="diagnostic-body">
+                        <tr class="placeholder">
+                            <td colspan="5">Waiting for validation to start…</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+            <p id="stream-status" class="status-text" aria-live="polite"></p>
+            <div id="acceptance-summary" class="acceptance-summary" hidden></div>
+        </section>
+
+        <section class="panel downloads" aria-labelledby="downloads-heading">
+            <h2 id="downloads-heading">4. Outputs</h2>
+            <div>
+                <h3>Validation Artifacts</h3>
+                <ul id="artifact-links" class="link-list empty">
+                    <li>Run validation to produce artifacts.</li>
+                </ul>
+            </div>
+            <div>
+                <h3>Auto-Fix Outputs</h3>
+                <ul id="autofix-links" class="link-list empty">
+                    <li>Run auto-fix to see generated files.</li>
+                </ul>
+            </div>
+            <div>
+                <h3>Activity Log</h3>
+                <div id="log-output" class="log" aria-live="polite"></div>
+            </div>
+        </section>
+    </main>
+
+    <script src="app.js" type="module"></script>
+</body>
+</html>

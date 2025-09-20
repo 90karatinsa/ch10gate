@@ -25,7 +25,10 @@ func main() {
 	}
 	defer srv.Close()
 
-	router := server.NewRouter(srv)
+	router, err := server.NewRouter(srv)
+	if err != nil {
+		log.Fatalf("router init: %v", err)
+	}
 	httpServer := &http.Server{
 		Addr:         *addr,
 		Handler:      router,
