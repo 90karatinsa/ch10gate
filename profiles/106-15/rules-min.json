@@ -297,6 +297,19 @@
         "10.11.6"
       ],
       "message": "Transfer/directory files must contain a valid directory chain"
+    },
+    {
+      "ruleId": "RP-0022",
+      "name": "DictionaryCompliance",
+      "scope": "file",
+      "stage": "type-specific",
+      "severity": "WARN",
+      "fixable": false,
+      "fixFunction": "ValidateAgainstDictionaries",
+      "refs": [
+        "Vendor ICD"
+      ],
+      "message": "Validate telemetry words against ICD dictionaries"
     }
   ]
 }

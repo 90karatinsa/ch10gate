@@ -37,6 +37,8 @@ const (
 
 func int64Ptr(v int64) *int64 { return &v }
 
+func intPtr(v int) *int { return &v }
+
 func stringPtr(s string) *string { return &s }
 
 func nextUnusedChannelID(used map[uint16]bool) uint16 {
@@ -124,6 +126,7 @@ func (e *Engine) RegisterBuiltins() {
 	e.Register("UpdateTMATSDigest", UpdateTMATSDigest)
 	e.Register("NormalizeTMATSChannelMap", NormalizeTMATSChannelMap)
 	e.Register("SyncSecondaryTimeFmt", SyncSecondaryTimeFmt)
+	e.Register("ValidateAgainstDictionaries", ValidateAgainstDictionaries)
 	e.Register("ValidateOrRebuildDirectory", ValidateOrRebuildDirectory)
 	e.Register("FixFileExtension", FixFileExtension)
 }
@@ -1550,6 +1553,315 @@ func WarnA429Parity(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 		}
 	}
 
+	return diag, false, nil
+}
+
+func ValidateAgainstDictionaries(ctx *Context, rule Rule) (Diagnostic, bool, error) {
+	diag := Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: INFO, Message: "Dictionary compliance verified", Refs: rule.Refs}
+	if ctx == nil {
+		diag.Severity = ERROR
+		diag.Message = "no context provided"
+		return diag, false, errors.New("nil context")
+	}
+	if err := ctx.EnsureFileIndex(); err != nil {
+		diag.Severity = ERROR
+		diag.Message = "cannot index file"
+		return diag, false, err
+	}
+	if ctx.Index == nil || len(ctx.Index.Packets) == 0 {
+		diag.Message = "no packets to inspect"
+		return diag, false, nil
+	}
+	if ctx.Dictionaries == nil || ctx.Dictionaries.IsEmpty() {
+		diag.Message = "no dictionaries provided"
+		return diag, false, nil
+	}
+	if ctx.DictionaryReport == nil {
+		ctx.DictionaryReport = &DictionaryComplianceReport{}
+	}
+	report := ctx.DictionaryReport
+	report.MIL1553 = nil
+	report.A429 = nil
+
+	type milFindingKey struct {
+		channel  uint16
+		rt       uint8
+		sa       uint8
+		kind     byte
+		observed int
+		expected int
+		issue    string
+	}
+	type a429FindingKey struct {
+		channel uint16
+		label   uint8
+		sdi     uint8
+		issue   string
+	}
+	type diagCandidate struct {
+		severity    Severity
+		packetIndex int
+		channelID   uint16
+		offset      string
+		detail      string
+	}
+
+	severityRank := func(s Severity) int {
+		switch s {
+		case ERROR:
+			return 3
+		case WARN:
+			return 2
+		case INFO:
+			return 1
+		default:
+			return 0
+		}
+	}
+
+	var candidate *diagCandidate
+	updateCandidate := func(pkt *ch10.PacketIndex, idx int, severity Severity, detail string) {
+		r := severityRank(severity)
+		if candidate == nil || r > severityRank(candidate.severity) || (r == severityRank(candidate.severity) && idx < candidate.packetIndex) {
+			entry := diagCandidate{severity: severity, packetIndex: idx, detail: detail}
+			if pkt != nil {
+				entry.channelID = pkt.ChannelID
+				entry.offset = fmt.Sprintf("0x%X", pkt.Offset)
+			}
+			candidate = &entry
+		}
+	}
+
+	milMap := make(map[milFindingKey]*Dictionary1553Finding)
+	a429Map := make(map[a429FindingKey]*DictionaryA429Finding)
+	hasError := false
+	hasWarn := false
+
+	for i := range ctx.Index.Packets {
+		pkt := &ctx.Index.Packets[i]
+		if pkt.MIL1553 != nil {
+			info := pkt.MIL1553
+			if info.ParseError == "" {
+				for _, msg := range info.Messages {
+					if !msg.HasCommandWord {
+						continue
+					}
+					cmd := msg.CommandWord
+					rt := uint8((cmd >> 11) & 0x1F)
+					sa := uint8((cmd >> 5) & 0x1F)
+					raw := int(cmd & 0x1F)
+					isMode := sa == 0 || sa == 0x1F
+					observed := 0
+					if isMode {
+						observed = raw
+					} else {
+						if raw == 0 {
+							observed = 32
+						} else {
+							observed = raw
+						}
+					}
+					entry, ok := ctx.Dictionaries.LookupMIL1553(rt, sa)
+					if !ok {
+						hasWarn = true
+						issue := "No dictionary entry"
+						if isMode {
+							issue = fmt.Sprintf("No dictionary entry for mode %d", observed)
+						} else if observed > 0 {
+							issue = fmt.Sprintf("No dictionary entry (WC=%d)", observed)
+						}
+						key := milFindingKey{channel: pkt.ChannelID, rt: rt, sa: sa, kind: 2, observed: observed, expected: -1, issue: issue}
+						finding := milMap[key]
+						if finding == nil {
+							finding = &Dictionary1553Finding{
+								ChannelID:   pkt.ChannelID,
+								RT:          rt,
+								SA:          sa,
+								Occurrences: 1,
+								Severity:    WARN,
+								Issue:       issue,
+							}
+							if !isMode && observed > 0 {
+								finding.WordCount = intPtr(observed)
+							}
+							if isMode {
+								finding.ModeCode = intPtr(observed)
+							}
+							milMap[key] = finding
+						} else {
+							finding.Occurrences++
+						}
+						updateCandidate(pkt, i, WARN, fmt.Sprintf("RT %02d SA %02d: %s", rt, sa, issue))
+						continue
+					}
+					name := strings.TrimSpace(entry.Name)
+					if isMode {
+						if expected, ok := entry.ModeCodeValue(); ok {
+							if expected != raw {
+								hasError = true
+								issue := fmt.Sprintf("Mode code mismatch (observed %d expected %d)", raw, expected)
+								key := milFindingKey{channel: pkt.ChannelID, rt: rt, sa: sa, kind: 1, observed: raw, expected: expected, issue: issue}
+								finding := milMap[key]
+								if finding == nil {
+									finding = &Dictionary1553Finding{
+										ChannelID:        pkt.ChannelID,
+										RT:               rt,
+										SA:               sa,
+										Name:             name,
+										Occurrences:      1,
+										Severity:         ERROR,
+										Issue:            issue,
+										ModeCode:         intPtr(raw),
+										ExpectedModeCode: intPtr(expected),
+									}
+									milMap[key] = finding
+								} else {
+									finding.Occurrences++
+								}
+								updateCandidate(pkt, i, ERROR, fmt.Sprintf("RT %02d SA %02d: %s", rt, sa, issue))
+							}
+						}
+						continue
+					}
+					if expected, ok := entry.WordCountValue(); ok {
+						if expected == 0 {
+							expected = 32
+						}
+						if expected != observed {
+							hasError = true
+							issue := fmt.Sprintf("Word count mismatch (observed %d expected %d)", observed, expected)
+							key := milFindingKey{channel: pkt.ChannelID, rt: rt, sa: sa, kind: 0, observed: observed, expected: expected, issue: issue}
+							finding := milMap[key]
+							if finding == nil {
+								finding = &Dictionary1553Finding{
+									ChannelID:         pkt.ChannelID,
+									RT:                rt,
+									SA:                sa,
+									Name:              name,
+									Occurrences:       1,
+									Severity:          ERROR,
+									Issue:             issue,
+									WordCount:         intPtr(observed),
+									ExpectedWordCount: intPtr(expected),
+								}
+								milMap[key] = finding
+							} else {
+								finding.Occurrences++
+							}
+							updateCandidate(pkt, i, ERROR, fmt.Sprintf("RT %02d SA %02d: %s", rt, sa, issue))
+						}
+					}
+				}
+			}
+		}
+		if pkt.A429 != nil {
+			info := pkt.A429
+			if info.ParseError == "" {
+				for _, word := range info.Words {
+					if _, ok := ctx.Dictionaries.LookupA429(word.Label, word.SDI); ok {
+						continue
+					}
+					hasWarn = true
+					issue := "No dictionary entry"
+					key := a429FindingKey{channel: pkt.ChannelID, label: word.Label, sdi: word.SDI, issue: issue}
+					finding := a429Map[key]
+					if finding == nil {
+						finding = &DictionaryA429Finding{
+							ChannelID:   pkt.ChannelID,
+							Label:       word.Label,
+							SDI:         word.SDI,
+							Occurrences: 1,
+							Severity:    WARN,
+							Issue:       issue,
+						}
+						a429Map[key] = finding
+					} else {
+						finding.Occurrences++
+					}
+					updateCandidate(pkt, i, WARN, fmt.Sprintf("Label 0x%02X SDI %d: %s", word.Label, word.SDI, issue))
+				}
+			}
+		}
+	}
+
+	if len(milMap) > 0 {
+		report.MIL1553 = make([]Dictionary1553Finding, 0, len(milMap))
+		for _, f := range milMap {
+			report.MIL1553 = append(report.MIL1553, *f)
+		}
+		sort.Slice(report.MIL1553, func(i, j int) bool {
+			li := report.MIL1553[i]
+			lj := report.MIL1553[j]
+			ri := severityRank(li.Severity)
+			rj := severityRank(lj.Severity)
+			if ri != rj {
+				return ri > rj
+			}
+			if li.ChannelID != lj.ChannelID {
+				return li.ChannelID < lj.ChannelID
+			}
+			if li.RT != lj.RT {
+				return li.RT < lj.RT
+			}
+			if li.SA != lj.SA {
+				return li.SA < lj.SA
+			}
+			return li.Issue < lj.Issue
+		})
+	}
+	if len(a429Map) > 0 {
+		report.A429 = make([]DictionaryA429Finding, 0, len(a429Map))
+		for _, f := range a429Map {
+			report.A429 = append(report.A429, *f)
+		}
+		sort.Slice(report.A429, func(i, j int) bool {
+			li := report.A429[i]
+			lj := report.A429[j]
+			ri := severityRank(li.Severity)
+			rj := severityRank(lj.Severity)
+			if ri != rj {
+				return ri > rj
+			}
+			if li.ChannelID != lj.ChannelID {
+				return li.ChannelID < lj.ChannelID
+			}
+			if li.Label != lj.Label {
+				return li.Label < lj.Label
+			}
+			if li.SDI != lj.SDI {
+				return li.SDI < lj.SDI
+			}
+			return li.Issue < lj.Issue
+		})
+	}
+
+	totalMIL := len(report.MIL1553)
+	totalA429 := len(report.A429)
+	if totalMIL == 0 && totalA429 == 0 {
+		diag.Message = "Dictionary compliance verified"
+		return diag, false, nil
+	}
+
+	var parts []string
+	if totalMIL > 0 {
+		parts = append(parts, fmt.Sprintf("MIL-STD-1553=%d", totalMIL))
+	}
+	if totalA429 > 0 {
+		parts = append(parts, fmt.Sprintf("ARINC-429=%d", totalA429))
+	}
+	diag.Message = fmt.Sprintf("Dictionary mismatches detected (%s)", strings.Join(parts, ", "))
+	if candidate != nil && strings.TrimSpace(candidate.detail) != "" {
+		diag.Message += "; first issue: " + candidate.detail
+		diag.Severity = candidate.severity
+		diag.PacketIndex = candidate.packetIndex
+		diag.ChannelId = int(candidate.channelID)
+		diag.Offset = candidate.offset
+	}
+	if hasError {
+		diag.Severity = ERROR
+	} else if hasWarn {
+		diag.Severity = WARN
+	}
 	return diag, false, nil
 }
 

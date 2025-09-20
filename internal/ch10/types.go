@@ -61,6 +61,8 @@ type MIL1553Message struct {
 	LengthWord      uint16
 	IPDHStatus      uint16
 	IPDHLength      uint16
+	CommandWord     uint16
+	HasCommandWord  bool
 }
 
 type MIL1553Info struct {

@@ -1,0 +1,7 @@
+{
+  "a429": [
+    { "label": 26, "sdi": 0, "name": "IRS Latitude" },
+    { "label": 126, "sdi": 2, "name": "Bus Monitor Status" }
+  ],
+  "mil1553": []
+}

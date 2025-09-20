@@ -806,6 +806,18 @@ func parseMIL1553Payload(src dataSource, offset int64, payloadLen int64, dataTyp
 				info.ParseError = fmt.Sprintf("message %d extends past payload", msgIdx+1)
 				return info, nil
 			}
+			if msgLen >= 2 {
+				cwBuf, err := sliceExact(src, cursor, 2)
+				if err != nil {
+					if errors.Is(err, io.ErrUnexpectedEOF) {
+						info.ParseError = fmt.Sprintf("message %d command word truncated", msgIdx+1)
+						return info, nil
+					}
+					return info, err
+				}
+				msg.CommandWord = binary.BigEndian.Uint16(cwBuf)
+				msg.HasCommandWord = true
+			}
 			info.Messages = append(info.Messages, msg)
 			cursor += msgLen
 		case 2:
@@ -832,6 +844,18 @@ func parseMIL1553Payload(src dataSource, offset int64, payloadLen int64, dataTyp
 			if cursor+msgLen > end {
 				info.ParseError = fmt.Sprintf("message %d extends past payload", msgIdx+1)
 				return info, nil
+			}
+			if msgLen >= 2 {
+				cwBuf, err := sliceExact(src, cursor, 2)
+				if err != nil {
+					if errors.Is(err, io.ErrUnexpectedEOF) {
+						info.ParseError = fmt.Sprintf("message %d command word truncated", msgIdx+1)
+						return info, nil
+					}
+					return info, err
+				}
+				msg.CommandWord = binary.BigEndian.Uint16(cwBuf)
+				msg.HasCommandWord = true
 			}
 			info.Messages = append(info.Messages, msg)
 			cursor += msgLen
