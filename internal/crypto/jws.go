@@ -14,6 +14,12 @@ import (
 	"fmt"
 )
 
+type jwsHeader struct {
+	Alg string   `json:"alg"`
+	Typ string   `json:"typ,omitempty"`
+	X5C []string `json:"x5c,omitempty"`
+}
+
 type JWS struct {
 	Protected string `json:"protected"`
 	Payload   string `json:"payload"`
@@ -61,45 +67,60 @@ func parseRSAPrivateKey(pemBytes []byte) (*rsa.PrivateKey, error) {
 }
 
 func VerifyDetachedJWS(payload []byte, jws JWS, certPEM []byte) error {
-	if jws.Protected == "" || jws.Payload == "" || jws.Signature == "" {
-		return errors.New("jws missing fields")
-	}
-
-	expectedPayload := base64.RawURLEncoding.EncodeToString(payload)
-	if subtle.ConstantTimeCompare([]byte(expectedPayload), []byte(jws.Payload)) != 1 {
-		return errors.New("payload does not match manifest bytes")
-	}
-
-	protectedBytes, err := base64.RawURLEncoding.DecodeString(jws.Protected)
+	header, err := decodeProtectedHeader(jws)
 	if err != nil {
-		return fmt.Errorf("decode protected header: %w", err)
+		return err
 	}
-	var header struct {
-		Alg string `json:"alg"`
-	}
-	if err := json.Unmarshal(protectedBytes, &header); err != nil {
-		return fmt.Errorf("unmarshal protected header: %w", err)
-	}
-	if header.Alg != "RS256" {
-		return fmt.Errorf("unsupported alg %q", header.Alg)
-	}
-
-	sig, err := base64.RawURLEncoding.DecodeString(jws.Signature)
-	if err != nil {
-		return fmt.Errorf("decode signature: %w", err)
-	}
-
 	pub, err := parseRSAPublicKey(certPEM)
 	if err != nil {
 		return fmt.Errorf("parse public key: %w", err)
 	}
+	return verifyDetachedWithPublicKey(payload, jws, header, pub)
+}
 
-	signingInput := jws.Protected + "." + jws.Payload
-	h := sha256.Sum256([]byte(signingInput))
-	if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, h[:], sig); err != nil {
-		return fmt.Errorf("verify signature: %w", err)
+func VerifyDetachedJWSWithX5C(payload []byte, jws JWS, roots *x509.CertPool) (*x509.Certificate, error) {
+	if roots == nil {
+		return nil, errors.New("nil trust store")
 	}
-	return nil
+	header, err := decodeProtectedHeader(jws)
+	if err != nil {
+		return nil, err
+	}
+	if len(header.X5C) == 0 {
+		return nil, errors.New("jws header missing x5c")
+	}
+	certs := make([]*x509.Certificate, 0, len(header.X5C))
+	for i, encoded := range header.X5C {
+		der, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			return nil, fmt.Errorf("decode x5c[%d]: %w", i, err)
+		}
+		cert, err := x509.ParseCertificate(der)
+		if err != nil {
+			return nil, fmt.Errorf("parse x5c[%d]: %w", i, err)
+		}
+		certs = append(certs, cert)
+	}
+	leaf := certs[0]
+	var intermediates *x509.CertPool
+	if len(certs) > 1 {
+		intermediates = x509.NewCertPool()
+		for _, cert := range certs[1:] {
+			intermediates.AddCert(cert)
+		}
+	}
+	opts := x509.VerifyOptions{Roots: roots, Intermediates: intermediates}
+	if _, err := leaf.Verify(opts); err != nil {
+		return nil, fmt.Errorf("verify certificate chain: %w", err)
+	}
+	pub, ok := leaf.PublicKey.(*rsa.PublicKey)
+	if !ok {
+		return nil, errors.New("leaf certificate public key is not RSA")
+	}
+	if err := verifyDetachedWithPublicKey(payload, jws, header, pub); err != nil {
+		return nil, err
+	}
+	return leaf, nil
 }
 
 func parseRSAPublicKey(pemBytes []byte) (*rsa.PublicKey, error) {
@@ -128,4 +149,42 @@ func parseRSAPublicKey(pemBytes []byte) (*rsa.PublicKey, error) {
 	}
 
 	return nil, errors.New("unable to parse RSA public key")
+}
+
+func decodeProtectedHeader(jws JWS) (jwsHeader, error) {
+	if jws.Protected == "" {
+		return jwsHeader{}, errors.New("jws missing protected header")
+	}
+	protectedBytes, err := base64.RawURLEncoding.DecodeString(jws.Protected)
+	if err != nil {
+		return jwsHeader{}, fmt.Errorf("decode protected header: %w", err)
+	}
+	var header jwsHeader
+	if err := json.Unmarshal(protectedBytes, &header); err != nil {
+		return jwsHeader{}, fmt.Errorf("unmarshal protected header: %w", err)
+	}
+	return header, nil
+}
+
+func verifyDetachedWithPublicKey(payload []byte, jws JWS, header jwsHeader, pub *rsa.PublicKey) error {
+	if jws.Payload == "" || jws.Signature == "" {
+		return errors.New("jws missing fields")
+	}
+	expectedPayload := base64.RawURLEncoding.EncodeToString(payload)
+	if subtle.ConstantTimeCompare([]byte(expectedPayload), []byte(jws.Payload)) != 1 {
+		return errors.New("payload does not match manifest bytes")
+	}
+	if header.Alg != "RS256" {
+		return fmt.Errorf("unsupported alg %q", header.Alg)
+	}
+	sig, err := base64.RawURLEncoding.DecodeString(jws.Signature)
+	if err != nil {
+		return fmt.Errorf("decode signature: %w", err)
+	}
+	signingInput := jws.Protected + "." + jws.Payload
+	h := sha256.Sum256([]byte(signingInput))
+	if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, h[:], sig); err != nil {
+		return fmt.Errorf("verify signature: %w", err)
+	}
+	return nil
 }
