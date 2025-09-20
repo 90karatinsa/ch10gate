@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"example.com/ch10gate/internal/ch10"
+	"example.com/ch10gate/internal/common"
 )
 
 type Severity string
@@ -121,6 +122,8 @@ type Context struct {
 
 	PrimaryHeader *ch10.PacketHeader
 	Index         *ch10.FileIndex
+
+	Metrics *common.Metrics
 }
 
 func (ctx *Context) EnsureFileIndex() error {
@@ -138,6 +141,9 @@ func (ctx *Context) EnsureFileIndex() error {
 		return err
 	}
 	defer reader.Close()
+	if ctx.Metrics != nil {
+		reader.SetMetrics(ctx.Metrics)
+	}
 	for {
 		_, _, err := reader.Next()
 		if err == nil {

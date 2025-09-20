@@ -10,7 +10,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
+	"example.com/ch10gate/internal/common"
 	"example.com/ch10gate/internal/crypto"
 	"example.com/ch10gate/internal/manifest"
 	"example.com/ch10gate/internal/report"
@@ -64,11 +66,21 @@ func validateCmd(args []string) {
 	outAcc := fs.String("acceptance", "acceptance_report.json", "acceptance json")
 	includeTimestamps := fs.Bool("diag-include-timestamps", true, "include timestamp metadata in diagnostics output")
 	concurrency := fs.Int("concurrency", runtime.NumCPU(), "maximum concurrent channel evaluations")
+	metricsFlag := fs.Bool("metrics", false, "print validation throughput metrics")
+	progressFlag := fs.Bool("progress", false, "display validation progress updates")
 	fs.Parse(args)
 
 	if *in == "" || *rulesPath == "" {
 		fmt.Println("required: --in, --rules")
 		os.Exit(1)
+	}
+
+	var metrics *common.Metrics
+	if *metricsFlag || *progressFlag {
+		metrics = common.NewMetrics()
+		if info, err := os.Stat(*in); err == nil {
+			metrics.SetTotalBytes(info.Size())
+		}
 	}
 
 	rp, err := rules.LoadRulePack(*rulesPath)
@@ -81,8 +93,21 @@ func validateCmd(args []string) {
 	engine.SetConfigValue("diag.include_timestamps", *includeTimestamps)
 	engine.SetConcurrency(*concurrency)
 
-	ctx := &rules.Context{InputFile: *in, TMATSFile: *tmats, Profile: *profile}
+	ctx := &rules.Context{InputFile: *in, TMATSFile: *tmats, Profile: *profile, Metrics: metrics}
+	if metrics != nil {
+		metrics.Start()
+	}
+	var stopProgress func()
+	if metrics != nil && *progressFlag {
+		stopProgress = common.StartProgressPrinter(os.Stderr, metrics, 500*time.Millisecond)
+	}
 	diags, err := engine.Eval(ctx)
+	if stopProgress != nil {
+		stopProgress()
+	}
+	if metrics != nil {
+		metrics.Stop()
+	}
 	if err != nil {
 		fmt.Println("eval:", err)
 		os.Exit(1)
@@ -98,6 +123,20 @@ func validateCmd(args []string) {
 		os.Exit(1)
 	}
 	fmt.Printf("PASS=%v, errors=%d, warnings=%d, diagnostics=%d\n", rep.Summary.Pass, rep.Summary.Errors, rep.Summary.Warnings, len(diags))
+	if metrics != nil && *metricsFlag {
+		snap := metrics.Snapshot()
+		throughputBps := snap.ThroughputBytesPerSecond()
+		gbPerMin := throughputBps * 60 / 1_000_000_000
+		mbPerSec := throughputBps / 1_000_000
+		fmt.Printf("Metrics: duration=%s packets=%d resyncs=%d processed=%s throughput=%.2f GB/min (%.2f MB/s)\n",
+			snap.Duration.Round(10*time.Millisecond),
+			snap.Packets,
+			snap.Resyncs,
+			common.FormatBytes(snap.Bytes),
+			gbPerMin,
+			mbPerSec,
+		)
+	}
 }
 
 func autofixCmd(args []string) {
