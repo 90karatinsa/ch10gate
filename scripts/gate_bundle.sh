@@ -61,11 +61,17 @@ VERSION="${VERSION:-$(git -C "${ROOT_DIR}" describe --tags --always --dirty 2>/d
 BUILD_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 REVISION="$(git -C "${ROOT_DIR}" rev-parse HEAD 2>/dev/null || echo unknown)"
 
-DEFAULT_SIGNING_KEY="${ROOT_DIR}/config/dev/bundle_signing/dev_signing_key.pem"
-DEFAULT_SIGNING_CERT="${ROOT_DIR}/config/dev/bundle_signing/dev_signing_cert.pem"
+if [ -z "${GATE_BUNDLE_SIGNING_KEY:-}" ] || [ -z "${GATE_BUNDLE_SIGNING_CERT:-}" ]; then
+  cat <<'EOF' >&2
+fatal: bundle signing material not configured.
+Set GATE_BUNDLE_SIGNING_KEY to the PEM encoded private key and GATE_BUNDLE_SIGNING_CERT to the
+corresponding X.509 certificate before running this script.
+EOF
+  exit 1
+fi
 
-SIGNING_KEY_PATH="${GATE_BUNDLE_SIGNING_KEY:-${DEFAULT_SIGNING_KEY}}"
-SIGNING_CERT_PATH="${GATE_BUNDLE_SIGNING_CERT:-${DEFAULT_SIGNING_CERT}}"
+SIGNING_KEY_PATH="${GATE_BUNDLE_SIGNING_KEY}"
+SIGNING_CERT_PATH="${GATE_BUNDLE_SIGNING_CERT}"
 
 if [ ! -f "${SIGNING_KEY_PATH}" ]; then
   echo "fatal: signing key not found at ${SIGNING_KEY_PATH}" >&2
@@ -283,6 +289,12 @@ CH10CTL_LICENSE_PATH="${TMP_LICENSE}" "${BIN_DIR}/ch10ctl" manifest \
   --cert "${SIGNING_CERT_ABS}" \
   --jws-out SIGNATURE.jws
 popd >/dev/null
+
+echo "[gate-bundle] verifying manifest signature"
+CH10CTL_LICENSE_PATH="${TMP_LICENSE}" "${BIN_DIR}/ch10ctl" verify-signature \
+  --manifest "${BUNDLE_DIR}/manifest.json" \
+  --jws "${BUNDLE_DIR}/SIGNATURE.jws" \
+  --cert "${SIGNING_CERT_ABS}"
 
 trap - EXIT
 cleanup_license

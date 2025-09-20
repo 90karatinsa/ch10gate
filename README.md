@@ -31,12 +31,14 @@ schemas, service definitions, docs, and sample data:
 Environment knobs:
 
 * `VERSION` — override the git tag/hash embedded in the CLI binaries.
-* `GATE_BUNDLE_SIGNING_KEY` — path to the RSA private key used for manifest
-  signatures (default:
-  `config/dev/bundle_signing/dev_signing_key.pem`).
-* `GATE_BUNDLE_SIGNING_CERT` — path to the PEM encoded X.509 certificate that
-  corresponds to the signing key (default:
-  `config/dev/bundle_signing/dev_signing_cert.pem`).
+* `GATE_BUNDLE_SIGNING_KEY` — **required** path to the RSA private key used for
+  manifest signatures.
+* `GATE_BUNDLE_SIGNING_CERT` — **required** path to the PEM encoded X.509
+  certificate that corresponds to the signing key.
+
+Both variables must reference files that live outside of the repository; see
+[`deploy/README.md`](deploy/README.md) for guidance on managing signing
+materials. The bundle script will refuse to run until they are provided.
 
 Artifacts land in `DIST/ch10gate_bundle/`. Distribute that directory as-is for
 offline QA installations.
