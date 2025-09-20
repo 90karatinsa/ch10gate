@@ -5,13 +5,16 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	"example.com/ch10gate/internal/common"
@@ -52,6 +55,8 @@ func main() {
 		batchCmd(os.Args[2:])
 	case "undo":
 		undoCmd(os.Args[2:])
+	case "rulepack":
+		rulepackCmd(os.Args[2:])
 	default:
 		usage()
 	}
@@ -61,13 +66,14 @@ func usage() {
 	fmt.Printf(`ch10ctl %s (built %s) <command> [options]
 
 Commands:
-  validate  --in <file> --profile <profile> --rules <rulepack.json> --tmats <file> --out <diagnostics.jsonl> --acceptance <acceptance.json>
-  autofix   --in <file> --profile <profile> --rules <rulepack.json> --tmats <file>
+  validate  --in <file> --profile <profile> [--rules <rulepack.json> | --rulepack-id <id> [--rulepack-version <version>]] --tmats <file> --out <diagnostics.jsonl> --acceptance <acceptance.json>
+  autofix   --in <file> --profile <profile> [--rules <rulepack.json> | --rulepack-id <id> [--rulepack-version <version>]] --tmats <file>
   report    --diagnostics <diagnostics.jsonl> --acceptance <acceptance.json>
   manifest  --inputs <comma-separated> --out <manifest.json> [--sign --key <key.pem> --cert <cert.pem> --jws-out <file>]
   verify-signature --manifest <manifest.json> --jws <signature.jws> --cert <cert.pem>
   batch     --in <dir> --profile <profile> --rules <rulepack.json> --out-dir <dir>
   undo      --in <file.fixed.ch10> --audit <audit.jsonl> --out <restored.ch10>
+  rulepack  <install|list|remove|verify|set-default> [...]
 `, version, buildDate)
 }
 
@@ -85,6 +91,9 @@ func validateCmd(args []string) {
 	tmats := fs.String("tmats", "", "TMATS file")
 	profile := fs.String("profile", "106-15", "profile")
 	rulesPath := fs.String("rules", "", "rulepack.json")
+	rulePackID := fs.String("rulepack-id", "", "installed rule pack identifier")
+	rulePackVersion := fs.String("rulepack-version", "", "installed rule pack version")
+	allowUnsigned := fs.Bool("allow-unsigned-rulepack", false, "allow validation with unsigned rule packs")
 	outDiag := fs.String("out", "diagnostics.jsonl", "diagnostics output")
 	outAcc := fs.String("acceptance", "acceptance_report.json", "acceptance json")
 	includeTimestamps := fs.Bool("diag-include-timestamps", true, "include timestamp metadata in diagnostics output")
@@ -93,8 +102,16 @@ func validateCmd(args []string) {
 	progressFlag := fs.Bool("progress", false, "display validation progress updates")
 	fs.Parse(args)
 
-	if *in == "" || *rulesPath == "" {
-		fmt.Println("required: --in, --rules")
+	if *in == "" {
+		fmt.Println("required: --in")
+		os.Exit(1)
+	}
+	if *rulesPath != "" && *rulePackID != "" {
+		fmt.Println("--rules and --rulepack-id cannot be used together")
+		os.Exit(1)
+	}
+	if *rulePackVersion != "" && *rulePackID == "" {
+		fmt.Println("--rulepack-version requires --rulepack-id")
 		os.Exit(1)
 	}
 
@@ -106,10 +123,22 @@ func validateCmd(args []string) {
 		}
 	}
 
-	rp, err := rules.LoadRulePack(*rulesPath)
+	rp, source, err := rules.ResolveRulePack(rules.RulePackRequest{
+		Path:          *rulesPath,
+		RulePackId:    *rulePackID,
+		Version:       *rulePackVersion,
+		Profile:       *profile,
+		AllowUnsigned: *allowUnsigned,
+	})
 	if err != nil {
-		fmt.Println("load rulepack:", err)
+		fmt.Println("resolve rulepack:", err)
 		os.Exit(1)
+	}
+	if source.FromRepository {
+		fmt.Printf("Using rule pack %s@%s (profile %s)\n", source.RulePackId, source.Version, rp.Profile)
+		if source.Unsigned {
+			fmt.Println("WARNING: rule pack is unsigned")
+		}
 	}
 	engine := rules.NewEngine(rp)
 	engine.RegisterBuiltins()
@@ -168,13 +197,24 @@ func autofixCmd(args []string) {
 	tmats := fs.String("tmats", "", "TMATS file")
 	profile := fs.String("profile", "106-15", "profile")
 	rulesPath := fs.String("rules", "", "rulepack.json")
+	rulePackID := fs.String("rulepack-id", "", "installed rule pack identifier")
+	rulePackVersion := fs.String("rulepack-version", "", "installed rule pack version")
+	allowUnsigned := fs.Bool("allow-unsigned-rulepack", false, "allow validation with unsigned rule packs")
 	includeTimestamps := fs.Bool("diag-include-timestamps", true, "include timestamp metadata in diagnostics output")
 	concurrency := fs.Int("concurrency", 1, "maximum concurrent channel evaluations")
 	auditPath := fs.String("audit", "", "audit log output (jsonl)")
 	fs.Parse(args)
 
-	if *in == "" || *rulesPath == "" {
-		fmt.Println("required: --in, --rules")
+	if *in == "" {
+		fmt.Println("required: --in")
+		os.Exit(1)
+	}
+	if *rulesPath != "" && *rulePackID != "" {
+		fmt.Println("--rules and --rulepack-id cannot be used together")
+		os.Exit(1)
+	}
+	if *rulePackVersion != "" && *rulePackID == "" {
+		fmt.Println("--rulepack-version requires --rulepack-id")
 		os.Exit(1)
 	}
 
@@ -183,10 +223,22 @@ func autofixCmd(args []string) {
 		auditLogPath = *in + ".audit.jsonl"
 	}
 
-	rp, err := rules.LoadRulePack(*rulesPath)
+	rp, source, err := rules.ResolveRulePack(rules.RulePackRequest{
+		Path:          *rulesPath,
+		RulePackId:    *rulePackID,
+		Version:       *rulePackVersion,
+		Profile:       *profile,
+		AllowUnsigned: *allowUnsigned,
+	})
 	if err != nil {
-		fmt.Println("load rulepack:", err)
+		fmt.Println("resolve rulepack:", err)
 		os.Exit(1)
+	}
+	if source.FromRepository {
+		fmt.Printf("Using rule pack %s@%s (profile %s)\n", source.RulePackId, source.Version, rp.Profile)
+		if source.Unsigned {
+			fmt.Println("WARNING: rule pack is unsigned")
+		}
 	}
 	engine := rules.NewEngine(rp)
 	engine.RegisterBuiltins()
@@ -545,4 +597,203 @@ func batchCmd(args []string) {
 	_ = rulesPath
 	_ = outDir
 	fmt.Println("Batch mode placeholder: iterate files and call validate")
+}
+
+func rulepackCmd(args []string) {
+	if len(args) == 0 {
+		rulepackUsage()
+		os.Exit(1)
+	}
+	sub := args[0]
+	switch sub {
+	case "install":
+		rulepackInstallCmd(args[1:])
+	case "list":
+		rulepackListCmd(args[1:])
+	case "remove":
+		rulepackRemoveCmd(args[1:])
+	case "verify":
+		rulepackVerifyCmd(args[1:])
+	case "set-default":
+		rulepackSetDefaultCmd(args[1:])
+	default:
+		fmt.Println("unknown rulepack subcommand")
+		rulepackUsage()
+		os.Exit(1)
+	}
+}
+
+func rulepackUsage() {
+	fmt.Println("rulepack commands:")
+	fmt.Println("  install --file <package.rpkg.zip> [--allow-unsigned]")
+	fmt.Println("  list")
+	fmt.Println("  remove --id <rulepack> --version <version>")
+	fmt.Println("  verify --id <rulepack> --version <version>")
+	fmt.Println("  set-default --profile <profile> --id <rulepack> --version <version>")
+}
+
+func rulepackInstallCmd(args []string) {
+	fs := flag.NewFlagSet("rulepack install", flag.ExitOnError)
+	file := fs.String("file", "", "path to .rpkg.zip package")
+	allowUnsigned := fs.Bool("allow-unsigned", false, "allow installing unsigned packages")
+	fs.Parse(args)
+
+	if *file == "" {
+		fmt.Println("required: --file")
+		os.Exit(1)
+	}
+	repo, err := rules.DefaultRepository()
+	if err != nil {
+		fmt.Println("open repository:", err)
+		os.Exit(1)
+	}
+	installed, err := repo.InstallPackage(*file, *allowUnsigned)
+	if err != nil {
+		fmt.Println("install rule pack:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Installed %s@%s (profile %s)\n", installed.RulePack.RulePackId, installed.RulePack.Version, installed.RulePack.Profile)
+	if installed.Signed {
+		if installed.Signer != "" {
+			fmt.Printf("Signer: %s\n", installed.Signer)
+		}
+	} else {
+		fmt.Println("Package installed without signature")
+	}
+}
+
+func rulepackListCmd(args []string) {
+	fs := flag.NewFlagSet("rulepack list", flag.ExitOnError)
+	fs.Parse(args)
+	repo, err := rules.DefaultRepository()
+	if err != nil {
+		fmt.Println("open repository:", err)
+		os.Exit(1)
+	}
+	entries, err := repo.ListInstalled()
+	if err != nil {
+		fmt.Println("list rule packs:", err)
+		os.Exit(1)
+	}
+	defaults, err := repo.Defaults()
+	if err != nil {
+		fmt.Println("load defaults:", err)
+		os.Exit(1)
+	}
+	if len(entries) == 0 {
+		fmt.Println("No rule packs installed")
+		return
+	}
+	byKey := make(map[string][]string)
+	for profile, ref := range defaults {
+		key := ref.RulePackId + "@" + ref.Version
+		byKey[key] = append(byKey[key], profile)
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "ID\tVERSION\tPROFILE\tSIGNED\tDEFAULT FOR\tSIGNER")
+	for _, entry := range entries {
+		key := entry.RulePack.RulePackId + "@" + entry.RulePack.Version
+		profiles := byKey[key]
+		sort.Strings(profiles)
+		signed := "yes"
+		if !entry.Signed {
+			signed = "no"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			entry.RulePack.RulePackId,
+			entry.RulePack.Version,
+			entry.RulePack.Profile,
+			signed,
+			strings.Join(profiles, ","),
+			entry.Signer,
+		)
+	}
+	w.Flush()
+}
+
+func rulepackRemoveCmd(args []string) {
+	fs := flag.NewFlagSet("rulepack remove", flag.ExitOnError)
+	id := fs.String("id", "", "rule pack identifier")
+	version := fs.String("version", "", "rule pack version")
+	fs.Parse(args)
+
+	if *id == "" || *version == "" {
+		fmt.Println("required: --id, --version")
+		os.Exit(1)
+	}
+	repo, err := rules.DefaultRepository()
+	if err != nil {
+		fmt.Println("open repository:", err)
+		os.Exit(1)
+	}
+	if err := repo.Remove(*id, *version); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			fmt.Println("rule pack not found")
+		} else {
+			fmt.Println("remove rule pack:", err)
+		}
+		os.Exit(1)
+	}
+	fmt.Printf("Removed %s@%s\n", *id, *version)
+}
+
+func rulepackVerifyCmd(args []string) {
+	fs := flag.NewFlagSet("rulepack verify", flag.ExitOnError)
+	id := fs.String("id", "", "rule pack identifier")
+	version := fs.String("version", "", "rule pack version")
+	fs.Parse(args)
+
+	if *id == "" || *version == "" {
+		fmt.Println("required: --id, --version")
+		os.Exit(1)
+	}
+	repo, err := rules.DefaultRepository()
+	if err != nil {
+		fmt.Println("open repository:", err)
+		os.Exit(1)
+	}
+	_, source, err := repo.Load(*id, *version, false)
+	if err != nil {
+		fmt.Println("verify rule pack:", err)
+		os.Exit(1)
+	}
+	msg := "Signature OK"
+	if source.Signer != "" {
+		msg += fmt.Sprintf(" (signed by %s)", source.Signer)
+	}
+	fmt.Println(msg)
+}
+
+func rulepackSetDefaultCmd(args []string) {
+	fs := flag.NewFlagSet("rulepack set-default", flag.ExitOnError)
+	profile := fs.String("profile", "", "profile name")
+	id := fs.String("id", "", "rule pack identifier")
+	version := fs.String("version", "", "rule pack version")
+	fs.Parse(args)
+
+	if *profile == "" || *id == "" || *version == "" {
+		fmt.Println("required: --profile, --id, --version")
+		os.Exit(1)
+	}
+	repo, err := rules.DefaultRepository()
+	if err != nil {
+		fmt.Println("open repository:", err)
+		os.Exit(1)
+	}
+	rp, source, err := repo.Load(*id, *version, true)
+	if err != nil {
+		fmt.Println("load rule pack:", err)
+		os.Exit(1)
+	}
+	if source.Unsigned {
+		fmt.Println("WARNING: selected rule pack is unsigned")
+	}
+	if rp.Profile != "" && rp.Profile != *profile {
+		fmt.Printf("Warning: rule pack profile is %s\n", rp.Profile)
+	}
+	if err := repo.SetDefaultForProfile(*profile, rules.RulePackRef{RulePackId: *id, Version: *version}); err != nil {
+		fmt.Println("set default:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Default for profile %s set to %s@%s\n", *profile, *id, *version)
 }

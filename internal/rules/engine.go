@@ -686,6 +686,68 @@ func (e *Engine) buildGateMatrix() []GateResult {
 	return results
 }
 
+type RulePackSource struct {
+	FromRepository bool
+	RulePackId     string
+	Version        string
+	Path           string
+	Unsigned       bool
+	Signer         string
+}
+
+type RulePackRequest struct {
+	Path          string
+	RulePackId    string
+	Version       string
+	Profile       string
+	AllowUnsigned bool
+}
+
+// ResolveRulePack resolves a rule pack from either a file path or the local repository.
+func ResolveRulePack(options RulePackRequest) (RulePack, RulePackSource, error) {
+	if options.Path != "" {
+		rp, err := LoadRulePack(options.Path)
+		if err != nil {
+			return rp, RulePackSource{}, err
+		}
+		return rp, RulePackSource{Path: options.Path}, nil
+	}
+
+	repo, err := DefaultRepository()
+	if err != nil {
+		return RulePack{}, RulePackSource{}, err
+	}
+
+	var id, version string
+	if options.RulePackId != "" {
+		id = options.RulePackId
+		version = options.Version
+		if version == "" {
+			version, err = repo.latestVersionFor(id)
+			if err != nil {
+				return RulePack{}, RulePackSource{}, err
+			}
+			if version == "" {
+				return RulePack{}, RulePackSource{}, fmt.Errorf("no versions installed for %s", id)
+			}
+		}
+	} else if options.Profile != "" {
+		ref, ok, err := repo.DefaultForProfile(options.Profile)
+		if err != nil {
+			return RulePack{}, RulePackSource{}, err
+		}
+		if !ok {
+			return RulePack{}, RulePackSource{}, errors.New("no rule pack specified and no default for profile")
+		}
+		id = ref.RulePackId
+		version = ref.Version
+	} else {
+		return RulePack{}, RulePackSource{}, errors.New("no rule pack specified")
+	}
+
+	return repo.Load(id, version, options.AllowUnsigned)
+}
+
 func LoadRulePack(path string) (RulePack, error) {
 	var rp RulePack
 	b, err := os.ReadFile(path)
