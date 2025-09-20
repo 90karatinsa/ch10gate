@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	iofs "io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -76,7 +77,7 @@ Commands:
   report    --diagnostics <diagnostics.jsonl> --acceptance <acceptance.json> [--pdf <report.pdf> --lang <en|tr> --manifest <manifest.json>]
   manifest  --inputs <comma-separated> --out <manifest.json> [--sign --key <key.pem> --cert <cert.pem> --jws-out <file>]
   verify-signature --manifest <manifest.json> --jws <signature.jws> --cert <cert.pem>
-  batch     --in <dir> --profile <profile> --rules <rulepack.json> --out-dir <dir>
+  batch     --in <dir> --profile <profile> [--rules <rulepack.json> | --rulepack-id <id> [--rulepack-version <version>]] [--dict <dict.json>] [--tmats-dir <dir>] [--allow-unsigned-rulepack] --out-dir <dir>
   undo      --in <file.fixed.ch10> --audit <audit.jsonl> --out <restored.ch10>
   rulepack  <install|list|remove|verify|set-default> [...]
   update    --from <dir> [--install-root <dir> --bin-dir <dir> --cert <file>]
@@ -89,6 +90,118 @@ func machineHashForError() string {
 		return fmt.Sprintf("unavailable (%v)", err)
 	}
 	return hash
+}
+
+type validationOptions struct {
+	InputFile         string
+	TMATSFile         string
+	Profile           string
+	RulesPath         string
+	RulePackID        string
+	RulePackVersion   string
+	AllowUnsigned     bool
+	DictPath          string
+	OutDiagnostics    string
+	OutAcceptance     string
+	IncludeTimestamps bool
+	Concurrency       int
+	Metrics           *common.Metrics
+	Progress          bool
+	ProgressWriter    io.Writer
+}
+
+type validationResult struct {
+	RulePack       rules.RulePack
+	RulePackSource rules.RulePackSource
+	Acceptance     rules.AcceptanceReport
+	Diagnostics    []rules.Diagnostic
+}
+
+func ensureParentDir(path string) error {
+	if strings.TrimSpace(path) == "" {
+		return nil
+	}
+	dir := filepath.Dir(path)
+	if dir == "" || dir == "." {
+		return nil
+	}
+	return os.MkdirAll(dir, 0o755)
+}
+
+func runValidation(opts validationOptions) (validationResult, error) {
+	var result validationResult
+
+	rp, source, err := rules.ResolveRulePack(rules.RulePackRequest{
+		Path:          opts.RulesPath,
+		RulePackId:    opts.RulePackID,
+		Version:       opts.RulePackVersion,
+		Profile:       opts.Profile,
+		AllowUnsigned: opts.AllowUnsigned,
+	})
+	if err != nil {
+		return result, fmt.Errorf("resolve rulepack: %w", err)
+	}
+	result.RulePack = rp
+	result.RulePackSource = source
+
+	engine := rules.NewEngine(rp)
+	engine.RegisterBuiltins()
+	engine.SetConfigValue("diag.include_timestamps", opts.IncludeTimestamps)
+	if opts.Concurrency > 0 {
+		engine.SetConcurrency(opts.Concurrency)
+	}
+
+	ctx := &rules.Context{InputFile: opts.InputFile, TMATSFile: opts.TMATSFile, Profile: opts.Profile, Metrics: opts.Metrics}
+	if err := configureDictionaries(ctx, opts.DictPath); err != nil {
+		return result, fmt.Errorf("dictionary: %w", err)
+	}
+
+	if opts.Metrics != nil {
+		opts.Metrics.Start()
+	}
+	var stopProgress func()
+	if opts.Progress && opts.Metrics != nil {
+		progressWriter := opts.ProgressWriter
+		if progressWriter == nil {
+			progressWriter = os.Stderr
+		}
+		stopProgress = common.StartProgressPrinter(progressWriter, opts.Metrics, 500*time.Millisecond)
+	}
+
+	diags, err := engine.Eval(ctx)
+	if stopProgress != nil {
+		stopProgress()
+	}
+	if opts.Metrics != nil {
+		opts.Metrics.Stop()
+	}
+	if err != nil {
+		return result, fmt.Errorf("eval: %w", err)
+	}
+
+	if err := ensureParentDir(opts.OutDiagnostics); err != nil {
+		return result, fmt.Errorf("prepare diagnostics output: %w", err)
+	}
+	if opts.OutDiagnostics != "" {
+		if err := engine.WriteDiagnosticsNDJSON(opts.OutDiagnostics); err != nil {
+			return result, fmt.Errorf("write diags: %w", err)
+		}
+	}
+
+	rep := engine.MakeAcceptance()
+	result.Acceptance = rep
+	result.Diagnostics = diags
+
+	if err := ensureParentDir(opts.OutAcceptance); err != nil {
+		return result, fmt.Errorf("prepare acceptance output: %w", err)
+	}
+	if opts.OutAcceptance != "" {
+		if err := report.SaveAcceptanceJSON(rep, opts.OutAcceptance); err != nil {
+			return result, fmt.Errorf("write report: %w", err)
+		}
+	}
+
+	return result, nil
 }
 
 func validateCmd(args []string) {
@@ -130,62 +243,36 @@ func validateCmd(args []string) {
 		}
 	}
 
-	rp, source, err := rules.ResolveRulePack(rules.RulePackRequest{
-		Path:          *rulesPath,
-		RulePackId:    *rulePackID,
-		Version:       *rulePackVersion,
-		Profile:       *profile,
-		AllowUnsigned: *allowUnsigned,
+	result, err := runValidation(validationOptions{
+		InputFile:         *in,
+		TMATSFile:         *tmats,
+		Profile:           *profile,
+		RulesPath:         *rulesPath,
+		RulePackID:        *rulePackID,
+		RulePackVersion:   *rulePackVersion,
+		AllowUnsigned:     *allowUnsigned,
+		DictPath:          *dictPath,
+		OutDiagnostics:    *outDiag,
+		OutAcceptance:     *outAcc,
+		IncludeTimestamps: *includeTimestamps,
+		Concurrency:       *concurrency,
+		Metrics:           metrics,
+		Progress:          *progressFlag,
+		ProgressWriter:    os.Stderr,
 	})
 	if err != nil {
-		fmt.Println("resolve rulepack:", err)
+		fmt.Println(err)
 		os.Exit(1)
 	}
-	if source.FromRepository {
-		fmt.Printf("Using rule pack %s@%s (profile %s)\n", source.RulePackId, source.Version, rp.Profile)
-		if source.Unsigned {
+
+	if result.RulePackSource.FromRepository {
+		fmt.Printf("Using rule pack %s@%s (profile %s)\n", result.RulePackSource.RulePackId, result.RulePackSource.Version, result.RulePack.Profile)
+		if result.RulePackSource.Unsigned {
 			fmt.Println("WARNING: rule pack is unsigned")
 		}
 	}
-	engine := rules.NewEngine(rp)
-	engine.RegisterBuiltins()
-	engine.SetConfigValue("diag.include_timestamps", *includeTimestamps)
-	engine.SetConcurrency(*concurrency)
 
-	ctx := &rules.Context{InputFile: *in, TMATSFile: *tmats, Profile: *profile, Metrics: metrics}
-	if err := configureDictionaries(ctx, *dictPath); err != nil {
-		fmt.Println("dictionary:", err)
-		os.Exit(1)
-	}
-	if metrics != nil {
-		metrics.Start()
-	}
-	var stopProgress func()
-	if metrics != nil && *progressFlag {
-		stopProgress = common.StartProgressPrinter(os.Stderr, metrics, 500*time.Millisecond)
-	}
-	diags, err := engine.Eval(ctx)
-	if stopProgress != nil {
-		stopProgress()
-	}
-	if metrics != nil {
-		metrics.Stop()
-	}
-	if err != nil {
-		fmt.Println("eval:", err)
-		os.Exit(1)
-	}
-
-	if err := engine.WriteDiagnosticsNDJSON(*outDiag); err != nil {
-		fmt.Println("write diags:", err)
-		os.Exit(1)
-	}
-	rep := engine.MakeAcceptance()
-	if err := report.SaveAcceptanceJSON(rep, *outAcc); err != nil {
-		fmt.Println("write report:", err)
-		os.Exit(1)
-	}
-	fmt.Printf("PASS=%v, errors=%d, warnings=%d, diagnostics=%d\n", rep.Summary.Pass, rep.Summary.Errors, rep.Summary.Warnings, len(diags))
+	fmt.Printf("PASS=%v, errors=%d, warnings=%d, diagnostics=%d\n", result.Acceptance.Summary.Pass, result.Acceptance.Summary.Errors, result.Acceptance.Summary.Warnings, len(result.Diagnostics))
 	if metrics != nil && *metricsFlag {
 		snap := metrics.Snapshot()
 		throughputBps := snap.ThroughputBytesPerSecond()
@@ -709,13 +796,181 @@ func batchCmd(args []string) {
 	inDir := fs.String("in", ".", "input directory")
 	profile := fs.String("profile", "106-15", "profile")
 	rulesPath := fs.String("rules", "", "rulepack.json")
+	rulePackID := fs.String("rulepack-id", "", "installed rule pack identifier")
+	rulePackVersion := fs.String("rulepack-version", "", "installed rule pack version")
+	allowUnsigned := fs.Bool("allow-unsigned-rulepack", false, "allow validation with unsigned rule packs")
+	dictPath := fs.String("dict", "", "dictionary JSON file")
+	tmatsDir := fs.String("tmats-dir", "", "directory containing TMATS files")
 	outDir := fs.String("out-dir", "out", "results directory")
+	includeTimestamps := fs.Bool("diag-include-timestamps", true, "include timestamp metadata in diagnostics output")
+	concurrency := fs.Int("concurrency", runtime.NumCPU(), "maximum concurrent channel evaluations")
 	fs.Parse(args)
-	_ = inDir
-	_ = profile
-	_ = rulesPath
-	_ = outDir
-	fmt.Println("Batch mode placeholder: iterate files and call validate")
+
+	if *rulesPath != "" && *rulePackID != "" {
+		fmt.Println("--rules and --rulepack-id cannot be used together")
+		os.Exit(1)
+	}
+	if *rulePackVersion != "" && *rulePackID == "" {
+		fmt.Println("--rulepack-version requires --rulepack-id")
+		os.Exit(1)
+	}
+	if strings.TrimSpace(*inDir) == "" {
+		fmt.Println("required: --in")
+		os.Exit(1)
+	}
+	if strings.TrimSpace(*outDir) == "" {
+		fmt.Println("required: --out-dir")
+		os.Exit(1)
+	}
+
+	if info, err := os.Stat(*inDir); err != nil {
+		fmt.Println("input directory:", err)
+		os.Exit(1)
+	} else if !info.IsDir() {
+		fmt.Println("--in must point to a directory")
+		os.Exit(1)
+	}
+
+	var inputs []string
+	if err := filepath.WalkDir(*inDir, func(path string, d iofs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if strings.EqualFold(filepath.Ext(d.Name()), ".ch10") {
+			inputs = append(inputs, path)
+		}
+		return nil
+	}); err != nil {
+		fmt.Println("walk input:", err)
+		os.Exit(1)
+	}
+	if len(inputs) == 0 {
+		fmt.Printf("No .ch10 files found in %s\n", *inDir)
+		return
+	}
+	sort.Strings(inputs)
+
+	type batchFileResult struct {
+		Input       string
+		OutputDir   string
+		Acceptance  rules.AcceptanceReport
+		Diagnostics int
+		Err         error
+	}
+
+	var results []batchFileResult
+	printedRulePack := false
+
+	for _, ch10Path := range inputs {
+		res := batchFileResult{Input: ch10Path}
+		func() {
+			tmatsPath := findMatchingTMATS(ch10Path, *tmatsDir)
+			workDir, err := os.MkdirTemp("", "ch10ctl-batch-")
+			if err != nil {
+				res.Err = fmt.Errorf("create temp workspace: %w", err)
+				fmt.Fprintf(os.Stderr, "prepare workspace for %s: %v\n", ch10Path, err)
+				return
+			}
+			defer os.RemoveAll(workDir)
+
+			diagOut := filepath.Join(workDir, "diagnostics.jsonl")
+			accOut := filepath.Join(workDir, "acceptance.json")
+			result, err := runValidation(validationOptions{
+				InputFile:         ch10Path,
+				TMATSFile:         tmatsPath,
+				Profile:           *profile,
+				RulesPath:         *rulesPath,
+				RulePackID:        *rulePackID,
+				RulePackVersion:   *rulePackVersion,
+				AllowUnsigned:     *allowUnsigned,
+				DictPath:          *dictPath,
+				OutDiagnostics:    diagOut,
+				OutAcceptance:     accOut,
+				IncludeTimestamps: *includeTimestamps,
+				Concurrency:       *concurrency,
+			})
+			if err != nil {
+				res.Err = err
+				fmt.Fprintf(os.Stderr, "validate %s: %v\n", ch10Path, err)
+				return
+			}
+
+			if result.RulePackSource.FromRepository && !printedRulePack {
+				fmt.Printf("Using rule pack %s@%s (profile %s)\n", result.RulePackSource.RulePackId, result.RulePackSource.Version, result.RulePack.Profile)
+				if result.RulePackSource.Unsigned {
+					fmt.Println("WARNING: rule pack is unsigned")
+				}
+				printedRulePack = true
+			}
+
+			base := strings.TrimSuffix(filepath.Base(ch10Path), filepath.Ext(ch10Path))
+			finalDir := filepath.Join(*outDir, base)
+			if err := os.MkdirAll(finalDir, 0o755); err != nil {
+				res.Err = fmt.Errorf("prepare output directory: %w", err)
+				fmt.Fprintf(os.Stderr, "prepare output for %s: %v\n", ch10Path, err)
+				return
+			}
+			if err := copyFile(diagOut, filepath.Join(finalDir, "diagnostics.jsonl")); err != nil {
+				res.Err = fmt.Errorf("write diagnostics: %w", err)
+				fmt.Fprintf(os.Stderr, "write diagnostics for %s: %v\n", ch10Path, err)
+				return
+			}
+			if err := copyFile(accOut, filepath.Join(finalDir, "acceptance.json")); err != nil {
+				res.Err = fmt.Errorf("write acceptance: %w", err)
+				fmt.Fprintf(os.Stderr, "write acceptance for %s: %v\n", ch10Path, err)
+				return
+			}
+
+			fmt.Printf("Validated %s -> %s\n", ch10Path, finalDir)
+			res.OutputDir = finalDir
+			res.Acceptance = result.Acceptance
+			res.Diagnostics = len(result.Diagnostics)
+		}()
+		results = append(results, res)
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "FILE\tSTATUS\tERRORS\tWARNINGS\tDIAGNOSTICS\tOUTPUT")
+	failed := false
+	for _, r := range results {
+		display := r.Input
+		if rel, err := filepath.Rel(*inDir, r.Input); err == nil {
+			display = rel
+		}
+		if r.Err != nil {
+			fmt.Fprintf(w, "%s\tERROR\t-\t-\t-\t%s\n", display, r.Err)
+			failed = true
+			continue
+		}
+		status := "PASS"
+		if !r.Acceptance.Summary.Pass {
+			status = "FAIL"
+			failed = true
+		}
+		fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%d\t%s\n", display, status, r.Acceptance.Summary.Errors, r.Acceptance.Summary.Warnings, r.Diagnostics, r.OutputDir)
+	}
+	w.Flush()
+	if failed {
+		os.Exit(1)
+	}
+}
+
+func findMatchingTMATS(ch10Path, tmatsDir string) string {
+	baseName := strings.TrimSuffix(filepath.Base(ch10Path), filepath.Ext(ch10Path))
+	sameDir := filepath.Join(filepath.Dir(ch10Path), baseName+".tmats")
+	if info, err := os.Stat(sameDir); err == nil && !info.IsDir() {
+		return sameDir
+	}
+	if strings.TrimSpace(tmatsDir) != "" {
+		candidate := filepath.Join(tmatsDir, baseName+".tmats")
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+	}
+	return ""
 }
 
 func rulepackCmd(args []string) {
