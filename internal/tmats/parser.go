@@ -67,6 +67,52 @@ func parseString(raw string) *Document {
 	return doc
 }
 
+// Comments returns a copy of the comment lines present in the document.
+func (d *Document) Comments() []string {
+	if d == nil {
+		return nil
+	}
+	out := make([]string, len(d.comments))
+	copy(out, d.comments)
+	return out
+}
+
+// AddComment appends a comment line when it does not already exist.
+func (d *Document) AddComment(line string) bool {
+	if d == nil {
+		return false
+	}
+	trimmed := strings.TrimSpace(strings.TrimRight(line, "\r\n"))
+	if trimmed == "" {
+		return false
+	}
+	if !strings.HasPrefix(trimmed, "#") {
+		trimmed = "# " + trimmed
+	}
+	for _, existing := range d.comments {
+		if strings.TrimSpace(existing) == trimmed {
+			return false
+		}
+	}
+	d.comments = append(d.comments, trimmed)
+	return true
+}
+
+// EnsureCommentWithTag ensures a comment containing tag exists; if not, the
+// supplied text is appended as a new comment line.
+func (d *Document) EnsureCommentWithTag(tag, text string) bool {
+	if d == nil {
+		return false
+	}
+	tag = strings.TrimSpace(tag)
+	for _, existing := range d.comments {
+		if tag != "" && strings.Contains(existing, tag) {
+			return false
+		}
+	}
+	return d.AddComment(text)
+}
+
 func (d *Document) cloneOrder() []string {
 	out := make([]string, len(d.order))
 	copy(out, d.order)

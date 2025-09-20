@@ -37,6 +37,20 @@ func int64Ptr(v int64) *int64 { return &v }
 
 func stringPtr(s string) *string { return &s }
 
+func nextUnusedChannelID(used map[uint16]bool) uint16 {
+	var id uint16 = 1
+	for {
+		if !used[id] {
+			used[id] = true
+			return id
+		}
+		id++
+		if id == 0 {
+			id = 1
+		}
+	}
+}
+
 func (e *Engine) RegisterBuiltins() {
 	e.Register("CheckSyncPattern", CheckSyncPattern)
 	e.Register("FixHeaderChecksum", FixHeaderChecksum)
@@ -482,17 +496,177 @@ func FixLengths(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 }
 
 func RemapChannelIds(ctx *Context, rule Rule) (Diagnostic, bool, error) {
-	return Diagnostic{
-		Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: WARN,
-		Message: "channel id remap not implemented yet", Refs: rule.Refs,
-	}, false, ErrNotImplemented
+	diag := Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: INFO, Message: "channel id remap inspection", Refs: rule.Refs}
+	if ctx == nil || ctx.InputFile == "" {
+		diag.Severity = ERROR
+		diag.Message = "no input file provided"
+		return diag, false, errors.New("no input file")
+	}
+	if ctx.Profile == "" {
+		diag.Severity = ERROR
+		diag.Message = "profile required"
+		return diag, false, errors.New("profile required")
+	}
+	if err := ctx.EnsureFileIndex(); err != nil {
+		diag.Severity = ERROR
+		diag.Message = "cannot index file"
+		return diag, false, err
+	}
+	if ctx.Index == nil || len(ctx.Index.Packets) == 0 {
+		diag.Message = "no packets to inspect"
+		return diag, false, nil
+	}
+
+	used := make(map[uint16]bool)
+	zeroCount := 0
+	firstIdx := -1
+	var firstPkt *ch10.PacketIndex
+	for i := range ctx.Index.Packets {
+		pkt := &ctx.Index.Packets[i]
+		if pkt.ChannelID == 0 {
+			zeroCount++
+			if firstIdx < 0 {
+				firstIdx = i
+				firstPkt = pkt
+			}
+			continue
+		}
+		used[pkt.ChannelID] = true
+	}
+
+	if zeroCount == 0 {
+		diag.Message = "channel ids already non-zero"
+		return diag, false, nil
+	}
+
+	newID := nextUnusedChannelID(used)
+	remap := map[uint16]uint16{0: newID}
+
+	plan := &ch10.StructuralPlan{ChannelRemap: remap}
+	outPath := ctx.InputFile + ".fixed.ch10"
+	if err := ch10.RewriteWithPlan(ctx.InputFile, outPath, ctx.Profile, ctx.Index, plan); err != nil {
+		diag.Severity = ERROR
+		diag.Message = "failed to rewrite file with new channel id"
+		return diag, false, err
+	}
+
+	diag.FixSuggested = true
+	diag.FixApplied = true
+	diag.FixPatchId = filepath.Base(outPath)
+	diag.Message = fmt.Sprintf("remapped %d packet(s) from channel id 0 to %d, wrote %s", zeroCount, newID, filepath.Base(outPath))
+	if firstIdx >= 0 && firstPkt != nil {
+		diag.PacketIndex = firstIdx
+		diag.ChannelId = int(newID)
+		diag.Offset = fmt.Sprintf("0x%X", firstPkt.Offset)
+		if firstPkt.TimeStampUs >= 0 {
+			diag.TimestampUs = int64Ptr(firstPkt.TimeStampUs)
+			src := string(firstPkt.Source)
+			diag.TimestampSource = stringPtr(src)
+		}
+	}
+
+	if tmatsPath, err := annotateTMATSModified(ctx, rule, "Channel ID remap"); err != nil {
+		diag.Severity = WARN
+		diag.Message += fmt.Sprintf(" (TMATS update failed: %v)", err)
+	} else if tmatsPath != "" {
+		diag.Message += fmt.Sprintf(", updated TMATS %s", filepath.Base(tmatsPath))
+	}
+
+	return diag, true, nil
 }
 
 func RenumberSeq(ctx *Context, rule Rule) (Diagnostic, bool, error) {
-	return Diagnostic{
-		Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: INFO,
-		Message: "sequence renumber planned", Refs: rule.Refs,
-	}, false, nil
+	diag := Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: INFO, Message: "sequence renumber inspection", Refs: rule.Refs}
+	if ctx == nil || ctx.InputFile == "" {
+		diag.Severity = ERROR
+		diag.Message = "no input file provided"
+		return diag, false, errors.New("no input file")
+	}
+	if ctx.Profile == "" {
+		diag.Severity = ERROR
+		diag.Message = "profile required"
+		return diag, false, errors.New("profile required")
+	}
+	if err := ctx.EnsureFileIndex(); err != nil {
+		diag.Severity = ERROR
+		diag.Message = "cannot index file"
+		return diag, false, err
+	}
+	if ctx.Index == nil || len(ctx.Index.Packets) == 0 {
+		diag.Message = "no packets to inspect"
+		return diag, false, nil
+	}
+
+	type seqState struct {
+		next     uint8
+		needs    bool
+		firstIdx int
+		firstPkt *ch10.PacketIndex
+	}
+
+	states := make(map[uint16]*seqState)
+	for i := range ctx.Index.Packets {
+		pkt := &ctx.Index.Packets[i]
+		st := states[pkt.ChannelID]
+		if st == nil {
+			st = &seqState{next: pkt.SeqNum + 1, firstIdx: i, firstPkt: pkt}
+			states[pkt.ChannelID] = st
+			continue
+		}
+		if pkt.SeqNum != st.next {
+			st.needs = true
+		}
+		st.next = pkt.SeqNum + 1
+	}
+
+	var channels []uint16
+	for ch, st := range states {
+		if st.needs {
+			channels = append(channels, ch)
+		}
+	}
+	if len(channels) == 0 {
+		diag.Message = "channel sequences already continuous"
+		return diag, false, nil
+	}
+	sort.Slice(channels, func(i, j int) bool { return channels[i] < channels[j] })
+
+	plan := &ch10.StructuralPlan{RenumberChannels: make(map[uint16]bool)}
+	for _, ch := range channels {
+		plan.RenumberChannels[ch] = true
+	}
+
+	outPath := ctx.InputFile + ".fixed.ch10"
+	if err := ch10.RewriteWithPlan(ctx.InputFile, outPath, ctx.Profile, ctx.Index, plan); err != nil {
+		diag.Severity = ERROR
+		diag.Message = "failed to renumber channel sequences"
+		return diag, false, err
+	}
+
+	diag.FixSuggested = true
+	diag.FixApplied = true
+	diag.FixPatchId = filepath.Base(outPath)
+	diag.Message = fmt.Sprintf("renumbered sequences for %d channel(s), wrote %s", len(channels), filepath.Base(outPath))
+	firstCh := channels[0]
+	if st := states[firstCh]; st != nil && st.firstPkt != nil {
+		diag.PacketIndex = st.firstIdx
+		diag.ChannelId = int(firstCh)
+		diag.Offset = fmt.Sprintf("0x%X", st.firstPkt.Offset)
+		if st.firstPkt.TimeStampUs >= 0 {
+			diag.TimestampUs = int64Ptr(st.firstPkt.TimeStampUs)
+			src := string(st.firstPkt.Source)
+			diag.TimestampSource = stringPtr(src)
+		}
+	}
+
+	if tmatsPath, err := annotateTMATSModified(ctx, rule, "Sequence renumber"); err != nil {
+		diag.Severity = WARN
+		diag.Message += fmt.Sprintf(" (TMATS update failed: %v)", err)
+	} else if tmatsPath != "" {
+		diag.Message += fmt.Sprintf(", updated TMATS %s", filepath.Base(tmatsPath))
+	}
+
+	return diag, true, nil
 }
 
 func BlockUnknownDataType(ctx *Context, rule Rule) (Diagnostic, bool, error) {
@@ -509,12 +683,56 @@ func BlockUnknownDataType(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 	return Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: INFO, Message: "data type within provisional range", Refs: rule.Refs}, false, nil
 }
 
+func annotateTMATSModified(ctx *Context, rule Rule, detail string) (string, error) {
+	if ctx == nil || ctx.TMATSFile == "" {
+		return "", nil
+	}
+	doc, err := tmats.Parse(ctx.TMATSFile)
+	if err != nil {
+		return "", err
+	}
+	recordGroup := inferTMATSRecordGroup(doc)
+	changed := false
+	if doc.Set(fmt.Sprintf("%s\\RI3", recordGroup), "MODIFIED") {
+		changed = true
+	}
+	timestamp := time.Now().UTC().Format(time.RFC3339)
+	ri6 := fmt.Sprintf("%s at %s", detail, timestamp)
+	if doc.Set(fmt.Sprintf("%s\\RI6", recordGroup), ri6) {
+		changed = true
+	}
+	comment := fmt.Sprintf("Modified recording (%s): %s", rule.RuleId, ri6)
+	if doc.EnsureCommentWithTag(rule.RuleId, comment) {
+		changed = true
+	}
+	digest, err := doc.ComputeDigest()
+	if err != nil {
+		return "", err
+	}
+	if doc.Set("G\\SHA", digest) {
+		changed = true
+	}
+	if !changed {
+		return "", nil
+	}
+	outPath := ctx.TMATSFile + ".tmats.fixed"
+	if err := os.WriteFile(outPath, []byte(doc.String()), 0644); err != nil {
+		return "", err
+	}
+	return outPath, nil
+}
+
 func EnsureTimePacket(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 	diag := Diagnostic{Ts: time.Now(), File: ctx.InputFile, RuleId: rule.RuleId, Severity: INFO, Message: "time packet inspection", Refs: rule.Refs}
-	if ctx == nil {
+	if ctx == nil || ctx.InputFile == "" {
 		diag.Severity = ERROR
-		diag.Message = "no context provided"
-		return diag, false, errors.New("nil context")
+		diag.Message = "no input file provided"
+		return diag, false, errors.New("no input file")
+	}
+	if ctx.Profile == "" {
+		diag.Severity = ERROR
+		diag.Message = "profile required"
+		return diag, false, errors.New("profile required")
 	}
 	if err := ctx.EnsureFileIndex(); err != nil {
 		diag.Severity = ERROR
@@ -527,11 +745,6 @@ func EnsureTimePacket(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 	}
 
 	idx := ctx.Index
-	if !idx.HasTimePacket {
-		diag.Severity = ERROR
-		diag.Message = "no time packets detected"
-		return diag, false, nil
-	}
 
 	var (
 		firstTimeIdx       = -1
@@ -584,23 +797,6 @@ func EnsureTimePacket(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 		return diag, false, nil
 	}
 
-	if !idx.TimeSeenBeforeDynamic {
-		diag.Severity = WARN
-		diag.Message = "first dynamic packet observed before time reference"
-		if firstDynamicIdx >= 0 {
-			pkt := idx.Packets[firstDynamicIdx]
-			diag.PacketIndex = firstDynamicIdx
-			diag.ChannelId = int(pkt.ChannelID)
-			diag.Offset = fmt.Sprintf("0x%X", pkt.Offset)
-			if diag.TimestampUs == nil && pkt.TimeStampUs >= 0 {
-				diag.TimestampUs = int64Ptr(pkt.TimeStampUs)
-				src := string(pkt.Source)
-				diag.TimestampSource = stringPtr(src)
-			}
-		}
-		return diag, false, nil
-	}
-
 	if unsupportedIdx >= 0 {
 		pkt := idx.Packets[unsupportedIdx]
 		diag.Severity = WARN
@@ -616,14 +812,123 @@ func EnsureTimePacket(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 		return diag, false, nil
 	}
 
-	diag.Message = "time packet present before first dynamic packet"
-	if firstTimeIdx >= 0 {
-		pkt := idx.Packets[firstTimeIdx]
-		diag.PacketIndex = firstTimeIdx
-		diag.ChannelId = int(pkt.ChannelID)
-		diag.Offset = fmt.Sprintf("0x%X", pkt.Offset)
+	needInsert := false
+	if !idx.HasTimePacket {
+		needInsert = true
+	} else if !idx.TimeSeenBeforeDynamic {
+		needInsert = true
 	}
-	return diag, false, nil
+
+	if !needInsert {
+		diag.Message = "time packet present before first dynamic packet"
+		if firstTimeIdx >= 0 {
+			pkt := idx.Packets[firstTimeIdx]
+			diag.PacketIndex = firstTimeIdx
+			diag.ChannelId = int(pkt.ChannelID)
+			diag.Offset = fmt.Sprintf("0x%X", pkt.Offset)
+		}
+		return diag, false, nil
+	}
+
+	insertBefore := 0
+	if firstDynamicIdx >= 0 {
+		insertBefore = firstDynamicIdx
+	}
+
+	used := make(map[uint16]bool)
+	for i := range idx.Packets {
+		pkt := idx.Packets[i]
+		if pkt.ChannelID != 0 {
+			used[pkt.ChannelID] = true
+		}
+	}
+
+	channelID := uint16(0)
+	if firstTimePacket != nil {
+		channelID = firstTimePacket.ChannelID
+	}
+	remap := make(map[uint16]uint16)
+	if channelID == 0 {
+		channelID = nextUnusedChannelID(used)
+		if idx.HasTimePacket {
+			remap[0] = channelID
+		}
+	}
+	if channelID == 0 {
+		channelID = nextUnusedChannelID(used)
+	}
+
+	timeFormat := uint8(0)
+	if firstTimePacket != nil && firstTimePacket.HasSecHdr {
+		timeFormat = firstTimePacket.TimeFormat
+	} else if firstDynamicPacket != nil && firstDynamicPacket.HasSecHdr {
+		timeFormat = firstDynamicPacket.TimeFormat
+	}
+
+	timestamp := int64(0)
+	if firstTimePacket != nil && firstTimePacket.TimeStampUs >= 0 {
+		timestamp = firstTimePacket.TimeStampUs
+	} else if firstDynamicPacket != nil && firstDynamicPacket.TimeStampUs >= 0 {
+		timestamp = firstDynamicPacket.TimeStampUs
+	}
+	if timestamp < 0 {
+		timestamp = 0
+	}
+
+	packet, err := ch10.BuildTimePacket(ctx.Profile, channelID, timeFormat, timestamp)
+	if err != nil {
+		diag.Severity = ERROR
+		diag.Message = "failed to build time packet"
+		return diag, false, err
+	}
+
+	plan := &ch10.StructuralPlan{
+		Inserts:          []ch10.PacketInsert{{BeforeIndex: insertBefore, Packet: packet}},
+		RenumberChannels: map[uint16]bool{channelID: true},
+	}
+	if len(remap) > 0 {
+		plan.ChannelRemap = remap
+	}
+
+	outPath := ctx.InputFile + ".fixed.ch10"
+	if err := ch10.RewriteWithPlan(ctx.InputFile, outPath, ctx.Profile, ctx.Index, plan); err != nil {
+		diag.Severity = ERROR
+		diag.Message = "failed to insert time packet"
+		return diag, false, err
+	}
+
+	reason := "missing time packet"
+	if idx.HasTimePacket && !idx.TimeSeenBeforeDynamic {
+		reason = "time packet observed after dynamic data"
+	}
+
+	diag.FixSuggested = true
+	diag.FixApplied = true
+	diag.FixPatchId = filepath.Base(outPath)
+	diag.Severity = INFO
+	diag.Message = fmt.Sprintf("inserted time reference packet on channel %d (%s), wrote %s", channelID, reason, filepath.Base(outPath))
+	diag.ChannelId = int(channelID)
+	diag.PacketIndex = insertBefore
+	if insertBefore >= 0 && insertBefore < len(idx.Packets) {
+		diag.Offset = fmt.Sprintf("0x%X", idx.Packets[insertBefore].Offset)
+	} else if len(idx.Packets) > 0 {
+		last := idx.Packets[len(idx.Packets)-1]
+		diag.Offset = fmt.Sprintf("0x%X", last.Offset+int64(last.PacketLength)+4)
+	} else {
+		diag.Offset = "0x0"
+	}
+	diag.TimestampUs = int64Ptr(timestamp)
+	src := string(ch10.TimestampSourceTimePacket)
+	diag.TimestampSource = stringPtr(src)
+
+	if tmatsPath, err := annotateTMATSModified(ctx, rule, fmt.Sprintf("Inserted time packet (%s)", reason)); err != nil {
+		diag.Severity = WARN
+		diag.Message += fmt.Sprintf(" (TMATS update failed: %v)", err)
+	} else if tmatsPath != "" {
+		diag.Message += fmt.Sprintf(", updated TMATS %s", filepath.Base(tmatsPath))
+	}
+
+	return diag, true, nil
 }
 
 func pcmChecksumLength(flags uint8) int {
@@ -1101,6 +1406,12 @@ func FixA429Gap(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 	diag.FixSuggested = true
 	diag.FixApplied = true
 	diag.FixPatchId = filepath.Base(outPath)
+	if tmatsPath, err := annotateTMATSModified(ctx, rule, "ARINC-429 gap repair"); err != nil {
+		diag.Severity = WARN
+		diag.Message += fmt.Sprintf(" (TMATS update failed: %v)", err)
+	} else if tmatsPath != "" {
+		diag.Message += fmt.Sprintf(", updated TMATS %s", filepath.Base(tmatsPath))
+	}
 	return diag, true, nil
 }
 
@@ -1316,6 +1627,12 @@ func AddEthIPH(ctx *Context, rule Rule) (Diagnostic, bool, error) {
 			src := string(firstPacket.Source)
 			diag.TimestampSource = stringPtr(src)
 		}
+	}
+	if tmatsPath, err := annotateTMATSModified(ctx, rule, "Ethernet IPH insertion"); err != nil {
+		diag.Severity = WARN
+		diag.Message += fmt.Sprintf(" (TMATS update failed: %v)", err)
+	} else if tmatsPath != "" {
+		diag.Message += fmt.Sprintf(", updated TMATS %s", filepath.Base(tmatsPath))
 	}
 	return diag, true, nil
 }
